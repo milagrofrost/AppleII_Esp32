@@ -27,3 +27,7 @@
   #define DEBUG_PRINT(x,...)
   #define DEBUG_PRINTLN(x,...)
 #endif
+
+bool LoadBootDiskFromSD();
+extern char DiskLoadError[96];
+extern char LoadedDiskName[64];

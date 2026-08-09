@@ -19,10 +19,12 @@
 *****************************************************************************/
 
 #include "common.h"
-
-#ifdef DOS_33
-  #include "diskDos33.h"
-#endif
+#include "esp32-hal-psram.h"
+#include <dirent.h>
+#include <sys/stat.h>
+extern "C" {
+  #include "esp_spiram.h"
+}
 
 #ifdef RESCUE_RAIDERS
   #include "diskRescueRaiders.h"
@@ -49,6 +51,246 @@
 #endif
 
 unsigned long cycle;
+
+static const size_t DISK_IMAGE_SIZE = 143360;
+static const char * DISK_MOUNT_PATH = "/SD";
+static const char * DISK_DIRECTORY = "/SD/apple2/disks";
+static const char * LEGACY_DISK_PATH = "/SD/apple2/dos33.dsk";
+static const int MAX_DISK_IMAGES = 32;
+static const int MAX_VISIBLE_DISKS = 18;
+unsigned char * DiskImage = NULL;
+char DiskLoadError[96] = "Disk image has not been loaded";
+char LoadedDiskName[64] = "";
+
+struct DiskMenuEntry {
+  char path[128];
+  char name[64];
+};
+
+static DiskMenuEntry DiskMenu[MAX_DISK_IMAGES];
+static int DiskMenuCount = 0;
+
+static bool HasDSKExtension(const char * name) {
+  size_t length = strlen(name);
+  if (length < 4)
+    return false;
+  const char * extension = name + length - 4;
+  return extension[0] == '.' &&
+         (extension[1] == 'd' || extension[1] == 'D') &&
+         (extension[2] == 's' || extension[2] == 'S') &&
+         (extension[3] == 'k' || extension[3] == 'K');
+}
+
+static bool AddDiskMenuEntry(const char * path, const char * name) {
+  if (DiskMenuCount >= MAX_DISK_IMAGES)
+    return false;
+
+  struct stat fileInfo;
+  if (stat(path, &fileInfo) != 0 || !S_ISREG(fileInfo.st_mode))
+    return false;
+  if (fileInfo.st_size != (long) DISK_IMAGE_SIZE) {
+    DEBUG_PRINTF("[SD] Skipping %s: %ld bytes (need %u)\n",
+                 path, (long) fileInfo.st_size, (unsigned) DISK_IMAGE_SIZE);
+    return false;
+  }
+
+  snprintf(DiskMenu[DiskMenuCount].path, sizeof(DiskMenu[DiskMenuCount].path), "%s", path);
+  snprintf(DiskMenu[DiskMenuCount].name, sizeof(DiskMenu[DiskMenuCount].name), "%s", name);
+  DiskMenuCount++;
+  return true;
+}
+
+static void FindDiskImages() {
+  DiskMenuCount = 0;
+
+  // Keep the milestone-1 location as the default/fallback entry.
+  AddDiskMenuEntry(LEGACY_DISK_PATH, "dos33.dsk");
+
+  DIR * directory = opendir(DISK_DIRECTORY);
+  if (!directory) {
+    DEBUG_PRINTF("[SD] Directory %s not found; using legacy disk if available\n", DISK_DIRECTORY);
+    return;
+  }
+
+  struct dirent * item;
+  while (DiskMenuCount < MAX_DISK_IMAGES && (item = readdir(directory)) != NULL) {
+    if (!HasDSKExtension(item->d_name))
+      continue;
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", DISK_DIRECTORY, item->d_name);
+    AddDiskMenuEntry(path, item->d_name);
+  }
+  closedir(directory);
+
+  // Alphabetize the games while leaving the legacy DOS disk first.
+  for (int i = 1; i < DiskMenuCount - 1; i++) {
+    for (int j = i + 1; j < DiskMenuCount; j++) {
+      if (strcmp(DiskMenu[i].name, DiskMenu[j].name) > 0) {
+        DiskMenuEntry temporary = DiskMenu[i];
+        DiskMenu[i] = DiskMenu[j];
+        DiskMenu[j] = temporary;
+      }
+    }
+  }
+  DEBUG_PRINTF("[SD] Found %d valid disk image(s)\n", DiskMenuCount);
+}
+
+static void DrawDiskMenu(int selected) {
+  int first = 0;
+  if (selected >= MAX_VISIBLE_DISKS)
+    first = selected - MAX_VISIBLE_DISKS + 1;
+  int last = first + MAX_VISIBLE_DISKS;
+  if (last > DiskMenuCount)
+    last = DiskMenuCount;
+
+  canvas.setBrushColor(Color::Black);
+  canvas.clear();
+  canvas.setPenColor(Color::BrightYellow);
+  canvas.drawText(20, 15, "APPLE II DISK SELECTOR");
+  canvas.setPenColor(Color::White);
+  canvas.drawText(20, 30, "UP/DOWN: SELECT   ENTER: BOOT");
+
+  for (int index = first; index < last; index++) {
+    int y = 52 + (index - first) * 12;
+    if (index == selected) {
+      canvas.setBrushColor(Color::BrightGreen);
+      canvas.setPenColor(Color::Black);
+    } else {
+      canvas.setBrushColor(Color::Black);
+      canvas.setPenColor(Color::White);
+    }
+    char line[70];
+    snprintf(line, sizeof(line), "%c %s", index == selected ? '>' : ' ', DiskMenu[index].name);
+    canvas.drawText(20, y, line);
+  }
+
+  canvas.setBrushColor(Color::Black);
+  canvas.setPenColor(Color::BrightCyan);
+  char status[48];
+  snprintf(status, sizeof(status), "DISK %d OF %d", selected + 1, DiskMenuCount);
+  canvas.drawText(20, 278, status);
+}
+
+static int SelectDiskImage() {
+  if (DiskMenuCount == 1)
+    return 0;
+
+  auto keyboard = PS2Controller.keyboard();
+  keyboard->enableVirtualKeys(true, true);
+  int selected = 0;
+  DrawDiskMenu(selected);
+
+  for (;;) {
+    bool keyDown = false;
+    VirtualKey key = keyboard->getNextVirtualKey(&keyDown);
+    if (!keyDown)
+      continue;
+    if (key == fabgl::VK_UP || key == fabgl::VK_KP_UP) {
+      selected = selected > 0 ? selected - 1 : DiskMenuCount - 1;
+      DrawDiskMenu(selected);
+    } else if (key == fabgl::VK_DOWN || key == fabgl::VK_KP_DOWN) {
+      selected = selected + 1 < DiskMenuCount ? selected + 1 : 0;
+      DrawDiskMenu(selected);
+    } else if (key == fabgl::VK_RETURN || key == fabgl::VK_KP_ENTER) {
+      break;
+    } else if (key == fabgl::VK_ESCAPE) {
+      selected = 0;
+      break;
+    }
+  }
+
+  keyboard->enableVirtualKeys(false, false);
+  return selected;
+}
+
+bool LoadBootDiskFromSD() {
+  bool psramReady = false;
+  bool diskImageInPSRAM = false;
+  DEBUG_PRINTLN("[MEM] Initializing onboard PSRAM for disk buffer...");
+  if (esp_spiram_init() == ESP_OK) {
+#ifndef BOARD_HAS_PSRAM
+    esp_spiram_init_cache();
+#endif
+    psramReady = true;
+    DEBUG_PRINTLN("[MEM] PSRAM initialized");
+  } else {
+    DEBUG_PRINTLN("[MEM] PSRAM unavailable; will try internal RAM");
+  }
+
+  DEBUG_PRINTLN("[SD] Initializing ESP32-SBC-FabGL SD card...");
+  if (!fabgl::FileBrowser::mountSDCard(false, DISK_MOUNT_PATH, 2)) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "SD initialization failed");
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    return false;
+  }
+
+  FindDiskImages();
+  if (DiskMenuCount == 0) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "No valid .dsk images found");
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    fabgl::FileBrowser::unmountSDCard();
+    return false;
+  }
+
+  int selected = SelectDiskImage();
+  DEBUG_PRINTF("[SD] Selected %s\n", DiskMenu[selected].path);
+  FILE * imageFile = fopen(DiskMenu[selected].path, "rb");
+  if (!imageFile) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot open selected disk");
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    fabgl::FileBrowser::unmountSDCard();
+    return false;
+  }
+
+  fseek(imageFile, 0, SEEK_END);
+  long imageSize = ftell(imageFile);
+  rewind(imageFile);
+  DEBUG_PRINTF("[SD] Image size: %ld bytes\n", imageSize);
+  if (imageSize != (long) DISK_IMAGE_SIZE) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Invalid image size: %ld (need %u)", imageSize, (unsigned) DISK_IMAGE_SIZE);
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    fclose(imageFile);
+    fabgl::FileBrowser::unmountSDCard();
+    return false;
+  }
+
+  if (psramReady) {
+    // Olimex FabGL initializes PSRAM at runtime with the IDE PSRAM option
+    // disabled, then uses its address directly instead of the heap allocator.
+    DiskImage = (unsigned char *) SOC_EXTRAM_DATA_LOW;
+    diskImageInPSRAM = true;
+    DEBUG_PRINTLN("[MEM] Disk buffer assigned to onboard PSRAM");
+  }
+  if (!DiskImage) {
+    DEBUG_PRINTF("[MEM] Trying internal RAM: %u bytes free, largest block %u bytes\n",
+                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    DiskImage = (unsigned char *) malloc(DISK_IMAGE_SIZE);
+  }
+  if (!DiskImage) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot allocate %u bytes for disk", (unsigned) DISK_IMAGE_SIZE);
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    fclose(imageFile);
+    fabgl::FileBrowser::unmountSDCard();
+    return false;
+  }
+
+  size_t bytesRead = fread(DiskImage, 1, DISK_IMAGE_SIZE, imageFile);
+  fclose(imageFile);
+  fabgl::FileBrowser::unmountSDCard();
+  if (bytesRead != DISK_IMAGE_SIZE) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Short read: %u of %u bytes", (unsigned) bytesRead, (unsigned) DISK_IMAGE_SIZE);
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    if (!diskImageInPSRAM)
+      free(DiskImage);
+    DiskImage = NULL;
+    return false;
+  }
+
+  DiskLoadError[0] = '\0';
+  snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskMenu[selected].name);
+  DEBUG_PRINTF("[SD] Loaded %s into PSRAM (%u bytes)\n", LoadedDiskName, (unsigned) DISK_IMAGE_SIZE);
+  return true;
+}
 
 int FastMode = 1;
 /* 0:correctly emulate drive rotation speed, !0:faster, but
@@ -127,7 +369,7 @@ long lseekDisk(int handle, int newPos, int flags) {
     retPos = SeekPos + newPos;
     break; /* seek relative to current position */
   case SEEK_END:
-    retPos = 143360;
+    retPos = DISK_IMAGE_SIZE + newPos;
     break; /* seek relative to end of file */
   }
   SeekPos = retPos;
@@ -145,9 +387,12 @@ int openDisk(const char * Path, int flags) {
 
 /***************************************************************************************************************************************/
 void readSector(int drvAtivo, void * buf, size_t size) {
-#ifdef DOS_33
-    memcpy(buf, DOS3_3 + SeekPos, size);
-#endif
+  if (DiskImage && SeekPos <= DISK_IMAGE_SIZE && size <= DISK_IMAGE_SIZE - SeekPos) {
+    memcpy(buf, DiskImage + SeekPos, size);
+  } else {
+    memset(buf, 0, size);
+    DEBUG_PRINTF("[DISK] ERROR: invalid read at %u (%u bytes)\n", SeekPos, (unsigned) size);
+  }
 
 #ifdef RESCUE_RAIDERS
     memcpy(buf, Rescue_Raiders + SeekPos, size);
@@ -179,9 +424,7 @@ void readSector(int drvAtivo, void * buf, size_t size) {
 
 /***************************************************************************************************************************************/
 void writeSector(int drvAtivo, void * buf, size_t size) {
-#ifdef DOS_33
-  //memcpy (DOS3_3+SeekPos, buf, size);
-#endif
+  // Milestone 1: the SD-backed image is deliberately read-only.
 
 #ifdef RESCUE_RAIDERS
   //memcpy (Rescue_Raiders+SeekPos, buf, size);
@@ -225,7 +468,7 @@ long tell(int handle) {
 /***************************************************************************************************************************************/
 long FileSize(int filehandle) {
   long filelen;
-  filelen = 143360;
+  filelen = DISK_IMAGE_SIZE;
   //printf("file, filelen:%d\n",filelen);
   lseekDisk(filehandle, 0L, SEEK_SET);
   return filelen;
@@ -959,7 +1202,7 @@ void MountDisk(int disk) {
     attr = 0;
   }
   //    ds->WritePro = ( attr & FA_RDONLY ) ? 1 : 0;
-  ds -> WritePro = 0;
+  ds -> WritePro = 1;
   ds -> DiskFH = openDisk(ds -> DiskFN, (ds -> WritePro ? O_RDONLY : O_RDWR));
   ds -> DiskSize = 0L;
   if (ds -> DiskFH >= 0) {

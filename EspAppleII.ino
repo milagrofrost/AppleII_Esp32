@@ -17,6 +17,7 @@
     GNU General Public License for more details.
 
 *****************************************************************************/
+//meow
 
 #define DEBUG_PROG
 #define SHOWTASKCORE
@@ -78,7 +79,7 @@ unsigned char RAM_HGR_BACK[0x2000];
 #ifdef DEBUG_PROG
 #define BAUD_RATE  115200
 #define SERIAL_SIZE_RX  32    // used in Serial.setRxBufferSize()
-#define SERIAL_SIZE_TX  32    // used in Serial.setTxBufferSize()
+#define SERIAL_SIZE_TX  512   // keep startup diagnostics from being truncated
 #endif
 
 #ifdef DOS_33
@@ -212,7 +213,7 @@ void setup()
   disableCore0WDT();
   delay(100); // experienced crashes without this delay!
   disableCore1WDT();
- 
+
   VGAController.queueSize = 256;  // trade UI speed using less RAM and allow both WiFi
   VGAController.begin();
   
@@ -238,6 +239,9 @@ void setup()
   // Inicia teclado PS2
   PS2Controller.begin(PS2Preset::KeyboardPort0, KbdMode::NoVirtualKeys);
 
+  // Discover, select, and load the boot disk before starting emulator tasks.
+  bool diskReady = LoadBootDiskFromSD();
+
   // clear preferences
   preferences.clear();
 
@@ -245,8 +249,21 @@ void setup()
 
   // Tela Splash
   canvas.setBrushColor(Color::Black);
+  canvas.clear();
   canvas.setPenColor(Color::BrightYellow );
   canvas.drawText(20, 25, " Apple II - ESP32 FABGL (2023) ");
+
+  if (!diskReady) {
+    canvas.setPenColor(Color::BrightRed);
+    canvas.drawText(20, 50, "SD DISK ERROR");
+    canvas.drawText(20, 65, DiskLoadError);
+    DEBUG_PRINTLN("[BOOT] Emulator stopped because the boot disk is unavailable.");
+    return;
+  }
+
+  canvas.setPenColor(Color::BrightGreen);
+  canvas.drawText(20, 50, "Disk loaded from SD:");
+  canvas.drawText(20, 65, LoadedDiskName);
 
   DEBUG_PRINTF("free heap:%.1fkb", (float)esp_get_free_heap_size() / 1024.0);
   DEBUG_PRINTLN();
