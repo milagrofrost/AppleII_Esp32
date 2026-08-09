@@ -29,6 +29,80 @@ EspAppleII/EspAppleII.ino
 
 The nested duplicate sketch at `EspAppleII/EspAppleII/EspAppleII.ino`, if present in an older checkout, is not used.
 
+## Software setup
+
+### 1. Install Arduino IDE
+
+Install [Arduino IDE 2](https://www.arduino.cc/en/software). This project is an Arduino sketch, so PlatformIO or ESP-IDF is not required.
+
+### 2. Install ESP32 Arduino core 2.0.11
+
+In Arduino IDE:
+
+1. Open **Tools → Board → Boards Manager**.
+2. Search for `esp32` by Espressif Systems.
+3. Select version **2.0.11** and install it.
+
+Do not use the ESP32 3.x core for this tested configuration. FabGL and its runtime PSRAM setup depend on behavior provided by the 2.0.11 toolchain.
+
+### 3. Install the Olimex FabGL fork
+
+Use the [Olimex FabGL fork](https://github.com/OLIMEX/FabGL), not the standard FabGL Library Manager release.
+
+1. Download the Olimex repository as a ZIP file.
+2. In Arduino IDE, choose **Sketch → Include Library → Add .ZIP Library**.
+3. Select the downloaded ZIP.
+4. Restart Arduino IDE if the FabGL examples or headers are not detected.
+
+If another FabGL version is already installed, remove or rename it first. Multiple FabGL installations can cause Arduino to compile against the wrong library. The tested Olimex fork reports FabGL version 1.0.9.
+
+### 4. Install the Timer library
+
+The sketch requires Jack Christensen's [Arduino Timer library](https://github.com/JChristensen/Timer), which supplies `Timer.h`, `Timer.cpp`, `Event.h`, and `Event.cpp`.
+
+1. Download the Timer repository as a ZIP file.
+2. Choose **Sketch → Include Library → Add .ZIP Library**.
+3. Select the Timer ZIP.
+
+This project was tested with the classic Timer 1.x API. It is not the ESP32 hardware-timer API and not an unrelated library with a similar `Timer` name. After installation, a typical library directory contains:
+
+```text
+Arduino/libraries/Timer-master/
+├── Timer.h
+├── Timer.cpp
+├── Event.h
+└── Event.cpp
+```
+
+`Preferences`, SPI, Wi-Fi support used by FabGL, PSRAM support, FAT filesystem support, and the standard C file/directory APIs are supplied by ESP32 Arduino core 2.0.11. No separate libraries are required for them.
+
+### 5. Configure the board
+
+Select **Tools → Board → esp32 → ESP32 Dev Module**, then configure:
+
+```text
+CPU Frequency:     240MHz (WiFi/BT)
+Partition Scheme:  Huge APP (3MB No OTA/1MB SPIFFS)
+PSRAM:             Disabled
+Upload Speed:      921600 (use a lower speed if uploads are unreliable)
+```
+
+Select the serial port belonging to the ESP32-SBC-FabGL. PSRAM must remain disabled in the IDE because the firmware initializes it at runtime without enabling the compiler's PSRAM cache workaround.
+
+### 6. Prepare the SD card
+
+Format a microSD card as FAT32 and copy the `apple2` directory described below to its root. Insert the card into the ESP32-SBC-FabGL before powering or resetting the board.
+
+### 7. Compile and upload
+
+Open the root `EspAppleII.ino`, click **Verify**, and then click **Upload**. After upload, open **Tools → Serial Monitor** and select **115200 baud**.
+
+If Arduino reports a missing header:
+
+- `Timer.h`: install the Jack Christensen Timer library.
+- `fabgl.h` or `fabui.h`: install the Olimex FabGL fork and remove competing FabGL copies.
+- ESP32-specific headers: verify that ESP32 Arduino core **2.0.11** and **ESP32 Dev Module** are selected.
+
 ## SD-card disk images
 
 Apple II disk images are loaded from the ESP32-SBC-FabGL's microSD card into PSRAM before emulation starts. The emulator does not perform SD-card I/O for every emulated disk access.
