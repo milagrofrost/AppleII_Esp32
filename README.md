@@ -1,102 +1,146 @@
-# AppleII no ESP32 (saida de video VGA e som)
-![][1]
+# Apple II Emulator for ESP32
 
-[1]: Imagens/AppleII_ESP32_Compara.jpg
-***
-**Apple II**
-***
+![Apple II emulator comparison](Imagens/AppleII_ESP32_Compara.jpg)
 
-<p>É realmente incrivel o quanto o setor de embarcados evoluiu (e evolui), eu que entrei nessa area na época do surgimento do Apple II, que tive que aprender a programar o 6502 na unha e programava Z80 digitando o hex do código de maquina em um programador de eprom (somente quem é dessa época sabe do que to falando) acho impressionante como hoje podemos emular um 6502 e toda a engine de video de um Apple II dentro de um microcontrolador ESP32. Cheguei a duvidar quando, na época, me falaram que era possivel colocar todo o hardware de um Apple II dentro de um unico chip. (ainda não conhecia os FPGA´s na época)</p>
-<p>Pois bem, eu, como amante nostalgico de Apple II e como programador, achei que seria interessante descobrir se já daria pra fazer isso em um ESP32. E acredito que tive sucesso nisso.</p>
-<p>Ainda faltam alguns pormenores para resolver mas o principal foi feito, talvez com uma falha na paleta de cores e faltando alguns itens mas já é suficientemente ´jogável´.</p>
-<p>Hoje como me falta tempo para dar continuidade e resolver esses pormenores resolvi disponibilizar o código fonte na sua totalidade para que outros continuem a labuta (ou usem o código como ferramenta de aprendizado).</p>
+This project emulates an original Apple II on an ESP32, with VGA video, PS/2 keyboard input, and sound. It is intended both as a usable nostalgic emulator and as an educational example of 6502, Apple II video, and Disk II emulation on a modern microcontroller.
 
-<p>Dentre esses pormenores, cito alguns:</p>
+The project was originally created by Francisco J. A. Souza. The 6502 and disk-emulation sources were adapted from earlier emulator projects; their original authors should be credited when they are identified.
 
-* Está emulando somente o Apple II (não emula seus 'descendentes').
-* Só funciona com o disco 1 (não reconhece disco 2 mas é razoavelmente facil resolver isso).
-* Só trabalha com a pagina 1 (Texto, baixa e alta resolução). Foi feito uma gambiarra para alguns jogos escreverem na pagina 1 como se fosse a pagina 2. (notei no jogo Rescue Raiders uma deficiencia nisso porque o sincronismo entre a varredura da memória e o video não estão corretos)
-* Não emula um joystick (somente Teclado).
-* Não acessa arquivos no SD Card (Esse Kit de ESP32 em especial aceita um SD Card, onde caberiam muitos discos de 1.44Mb).
+## Current hardware target
 
-<p>Provavelmente faltem alguns outros 'pormenores' que eu não me atentei mas que não acredito que faça falta para quem quer apenas matar saudade do Apple II </p>
+The currently tested configuration is:
 
-<p>Deixei no pacote alguns jogos clássicos, já com a ROMs convertidas (arquivo xxx.DSK) para um array de bytes (estilo C).
-(Nem sei se ainda existem direitos autorais sobre os jogos que deixei como exemplo mas como não estou vendendo nada e existem inumeros sites em que é possivel baixar essa ROMS, acredito que não tenha maior problema)</p>
-<p>Para testa-las, basta retirar o comentário '//' ao lado dos #define do nome do jogo, no arquivo Esp32AppleII.ino (não esquecendo de deixar apenas um arquivo disponivel por compilação)  </p>
+- Olimex ESP32-SBC-FabGL
+- Olimex FabGL fork 1.0.9
+- ESP32 Arduino core 2.0.11
+- Board: **ESP32 Dev Module**
+- CPU frequency: **240 MHz**
+- Partition scheme: **Huge APP**
+- PSRAM setting in Arduino IDE: **Disabled**
+- Serial monitor: **115200 baud**
 
-![][2]
+Keep the Arduino IDE PSRAM setting disabled. The firmware initializes the ESP32-SBC-FabGL's onboard PSRAM at runtime, following the approach used by Olimex's FabGL examples.
 
-[2]: Imagens/TelaInicial.png
+Open and upload the root sketch:
 
-***
-<p>Alguns video funcionando:</p>
+```text
+EspAppleII/EspAppleII.ino
+```
 
- * [DOS 3.3 (Youtube)](https://www.youtube.com/watch?v=gkJJiDuz0lA)
- * [Rescue Raiders (Youtube)](https://youtu.be/1CllMtIGst4)
- * [Galaxian (Youtube)](https://youtu.be/dFom_zQjH2I)
- * [ChopFliter (Youtube)](https://youtu.be/LiarlgUO_FE)
- * [CannonBall Blitz (Youtube)](https://youtu.be/a9vT981Lyd8)
- 
-<p>Para testar outras ROMS é preciso converter o arquivo hex deles em array de constantes na sintaxe da linguagem C, existem inumeras formas de se fazer essa conversão, basta procurar no google mas usei essa esse site em especial, que converte já deixando praticamente no jeito certo:</p>
-<p>https://notisrac.github.io/FileToCArray<br></p>
+The nested duplicate sketch at `EspAppleII/EspAppleII/EspAppleII.ino`, if present in an older checkout, is not used.
 
-<p>Digamos então, por exemplo, que queremos converter o jogo Galaxian, cujo arquivo de disco eu baixei com o nome Galaxian(1980)(Starcraft).dsk</p>
+## SD-card disk images
 
-![][3]
+Apple II disk images are loaded from the ESP32-SBC-FabGL's microSD card into PSRAM before emulation starts. The emulator does not perform SD-card I/O for every emulated disk access.
 
-[3]: Imagens/ConverteDsktoArrayC.png
+Format the card as FAT32 and use this layout:
 
-<p>Depois bastaria clicar no botão 'save as file', nomear com extensão .h, adicionar ao projetos (como nos exemplos adicionados) e colocar o tamanho do array no código, como exemplificado abaixo:</p>
+```text
+SD card root/
+└── apple2/
+    ├── dos33.dsk
+    └── disks/
+        ├── choplifter.dsk
+        ├── galaxian.dsk
+        ├── rescue-raiders.dsk
+        └── another-game.dsk
+```
 
-<p>de:   const unsigned char Galaxian_1980_Starcraft_[] PROGMEM</p>
-<p>para: const unsigned char Galaxian_1980_Starcraft_[143360] PROGMEM</p>
+`/apple2/dos33.dsk` is the default and backward-compatible boot image. Additional images belong in `/apple2/disks/`.
 
-<p>Deixei como desafio descobrirem porque o jogo LodeRunner não funcionou, não lembro se ele precisa acessar um disco 2 ou se acessa algum banco de memória que não implementei no projeto, mas fica ai o desafio.</p>
+For the current milestone, every image must be:
 
-<p>Os arquivos CPU.INO e DISK.INO reaproveitei de projetos de outros autores e adaptei para o ESP32, assim que identifica-los colocarei aqui os devidos créditos.</p>
+- A standard DOS-order `.dsk` image
+- Exactly **143,360 bytes**
+- Read-only while running
 
-***
-**ESP32**
-***
+Images with other sizes are skipped and reported over serial. Formats such as `.po`, `.nib`, `.woz`, and 2MG are not currently supported.
 
-<p>Vamos falar um pouco do poderoso ESP32, lançado em 2016 sendo um sucessor do famoso ESP8266, é um microcontrolador com dois 'cores' que pode rodar a incriveis 240Mhz (incriveis mesmo, comparado com o 1Mhz do saudoso 6502), usei um core para emular o 6502 e o outro core para emular a parte de video e tratamento de teclado.</p>
+The repository includes a PowerShell extraction utility that recreates `dos33.dsk` from the original embedded array:
 
-<p>Esse device também tem Wifi e bluetooth embutidos (já imaginaram um AppleII acessando a internet?)</p>
+```powershell
+./extract_dos33.ps1
+```
 
-<p>Usei nesse projeto um kit facilmente encontrado no mercado (com muita variação no preço) que já vem com o ESP32 e conexão para entrada de teclado e mouse PS2, conector para saida de som, conector para SD Card, conector para saida VGA e conector USB (para programação e debug serial, entre outros) (vide imagem abaixo)</p>
+It creates:
 
-![][4]
+```text
+sdcard/apple2/dos33.dsk
+```
 
-[4]: Imagens/Esp32_Front.jpeg
+Copy the generated `apple2` directory to the root of the SD card.
 
-![][5]
+## Startup disk selector
 
-[5]: Imagens/Esp32_Back.jpeg
- 
-<p>Para a parte gráfica, usei a ótima biblioteca open-source FabGL(http://www.fabglib.org) para ESP32.</p>
+When more than one valid image is available, a VGA disk-selection screen appears at startup.
 
-**Arduino IDE**
+- **Up/Down:** change selection
+- **Enter:** load and boot the selected disk
+- **Escape:** select the first entry, normally `dos33.dsk`
 
-<p>Para quem é amante da linha AppleII mas não tem familiaridade com dispositivos embarcados (microcontroladores), em especial a linha Expressif (ESP32), deixo abaixo a configuração básica para programação utilizando a gratuita Arduino IDE (https://www.arduino.cc/en/software).</p> 
+The selector supports up to 32 valid images and displays 18 entries at a time. It runs before the emulator tasks start, then restores the existing raw PS/2 keyboard handling used by the Apple II emulator.
 
-<p>Obs: Não vou me estender aqui como programar o ESP32 porque já existe muita informação na internet sobre como fazer isso.</p>
+If only `/apple2/dos33.dsk` is present, it boots immediately without showing the selector.
 
-![][6]
+## Serial diagnostics
 
-[6]: Imagens/ConfigEsp32.png
+Open the serial monitor at 115200 baud. A normal startup resembles:
 
-![][7]
+```text
+EspApple II Emulator (ESP32)
+[MEM] Initializing onboard PSRAM for disk buffer...
+[MEM] PSRAM initialized
+[MEM] Disk buffer assigned to onboard PSRAM
+[SD] Initializing ESP32-SBC-FabGL SD card...
+[SD] Found 4 valid disk image(s)
+[SD] Selected /SD/apple2/disks/choplifter.dsk
+[SD] Image size: 143360 bytes
+[SD] Loaded choplifter.dsk into PSRAM (143360 bytes)
+```
 
-[7]: Imagens/ConfigEsp32_2.png
+Errors are reported for SD initialization, missing images, incorrect image sizes, allocation failures, file-open failures, and short reads. Startup stops before creating the emulator tasks if no disk can be loaded, and an error is displayed over VGA where practical.
 
-<p>Espero que esse Readme já seja suficiente para quem tenha um certo conhecimento ou desperte a curiosidade em muitos sobre programação do ESP32, sei que este é apenas 'mais um emulador' de Apple II e que, para windows, temos varios e de ótima qualidade e facilidade de uso, meu intuito foi mais estimular a prática e o conhecimento, espero que tenham gostado. boa sorte para todos.</p>
+## Emulator status and limitations
 
-***
-**Colaboração**
+The project currently:
 
-<p>Sou desenvolvedor autonomo então dependo dos meus trabalhos para tocar a vida (e as contas).</p>
-<p>Se alguém achar que mereço uma cerveja (ou um cafezinho), meu pix e meu paypal é o email: fj_souza@hotmail.com</p>
-<p>Se não achar ou não puder também não tem problema, usufrua e distribua conhecimentos.</p>
+- Emulates the original Apple II, not later Apple II models
+- Uses drive 1 only
+- Loads one disk at startup; runtime disk swapping is not implemented
+- Treats disk images as read-only, so saved games and disk writes do not persist
+- Implements page 1 for text, low-resolution, and high-resolution graphics
+- Contains compatibility workarounds for software that expects page 2
+- Uses a PS/2 keyboard; joystick emulation is not implemented
+- Preserves the existing 6502, video, keyboard, sound, and Disk II behavior
 
-***
+Some copy-protected games or software that relies on unsupported memory/video behavior may not work. Lode Runner was known not to work in the original project and remains an interesting debugging challenge.
+
+## Hardware
+
+The ESP32, introduced in 2016 as a successor to the ESP8266, contains two CPU cores running at up to 240 MHz. This project uses one core for 6502 execution and the other for video refresh and keyboard handling.
+
+The Olimex ESP32-SBC-FabGL provides the ESP32, VGA output, PS/2 keyboard and mouse connectors, audio output, microSD slot, and USB programming/debug connection on one board.
+
+![ESP32-SBC-FabGL front](Imagens/Esp32_Front.jpeg)
+
+![ESP32-SBC-FabGL back](Imagens/Esp32_Back.jpeg)
+
+Graphics and peripheral support use the open-source [FabGL library](http://www.fabglib.org) and the Olimex FabGL fork for ESP32-SBC-FabGL compatibility.
+
+## Videos
+
+- [DOS 3.3](https://www.youtube.com/watch?v=gkJJiDuz0lA)
+- [Rescue Raiders](https://youtu.be/1CllMtIGst4)
+- [Galaxian](https://youtu.be/dFom_zQjH2I)
+- [Choplifter](https://youtu.be/LiarlgUO_FE)
+- [CannonBall Blitz](https://youtu.be/a9vT981Lyd8)
+
+![Original startup screen](Imagens/TelaInicial.png)
+
+## License
+
+See [LICENSE](LICENSE) for the project's license terms.
+
+## Supporting the original author
+
+The original author is an independent developer. If you would like to buy him a beer or coffee, his Pix and PayPal address is `fj_souza@hotmail.com`. Otherwise, please enjoy the project, learn from it, and share the knowledge.
