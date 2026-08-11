@@ -18,8 +18,6 @@
 
 *****************************************************************************/
 
-#define KEYBD_DATA_PIN 4
-
 const unsigned char scancode_to_apple[] PROGMEM = {
  //$0    $1    $2    $3    $4    $5    $6    $7    $8    $9    $A    $B    $C    $D    $E    $F
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //$00
@@ -46,6 +44,12 @@ unsigned short keyboard_data[3] = {0, 0, 0};
 unsigned char keyboard_mbyte = 0;
 boolean shift_enabled = false;
 
+// Host-side hot-key bookkeeping for disk manager hand-off.
+static bool HostCtrlDown = false;
+static bool HostAltDown = false;
+static bool HostDeleteDown = false;
+static bool HostBreakPending = false;
+
 // In apple II scancode format
 volatile unsigned char keymem = 0;
 
@@ -64,10 +68,94 @@ void keyboard_strobe() {
   keymem&=0x7F;
 }
 
+static void HostDiskManagerTrigger() {
+  DEBUG_PRINTLN("[HOST] Ctrl+Alt+Del requested: disk manager hot-key intercepted");
+
+  if (Task1 != NULL) {
+    vTaskSuspend(Task1);
+  }
+
+  FindDiskImages();
+  if (DiskMenuCount == 0) {
+    DEBUG_PRINTLN("[HOST] No disk images are available for the manager screen");
+    if (Task1 != NULL) {
+      vTaskResume(Task1);
+    }
+    return;
+  }
+
+  int selected = SelectDiskImage();
+  DEBUG_PRINTF("[HOST] Cold boot drive 1 from %s\n", DiskEntryPath(selected));
+
+  if (LoadDiskImageForDrive(0, DiskEntryPath(selected))) {
+    // A different game needs a power-on-style boot, not merely a disk attach.
+    // Clear the emulated machine while this video/keyboard task owns the menu
+    // and the CPU task is suspended.
+    memset(RAM, 0, sizeof(RAM));
+    memset(RAMEXT, 0, sizeof(RAMEXT));
+    memset(RAM_TXT_BACK, 0xFF, sizeof(RAM_TXT_BACK));
+    memset(RAM_HGR_BACK, 0xFF, sizeof(RAM_HGR_BACK));
+    ResetMemorySoftSwitches();
+    A = X = Y = 0;
+    SR = 0x20;
+    STP = 0xFD;
+    keymem = 0;
+    snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskEntryName(selected));
+    initCode();
+    canvas.setBrushColor(Color::Black);
+    canvas.clear();
+    DrawVGAAlignmentMarkers();
+    DEBUG_PRINTF("[HOST] drive 1 cold boot initialized: %s PC=%04X\n",
+                 DiskEntryName(selected), PC);
+  } else {
+    DEBUG_PRINTF("[HOST] failed to load selection into drive 1: %s (%s)\n",
+                 DiskEntryPath(selected), DiskLoadError);
+  }
+
+  if (Task1 != NULL) {
+    vTaskResume(Task1);
+  }
+}
+
 /***************************************************************************************************************************************/
 //
 /***************************************************************************************************************************************/
 void keyboard_In(int keyPush) {
+
+  // Host-level Ctrl+Alt+Del hot-key intercept. This sequence must never be
+  // translated into an Apple II key. Track PS/2 make and break sequences
+  // without swallowing their bytes, so the normal raw-scancode parser remains
+  // synchronized after returning from the disk menu.
+  if (keyPush == 0xF0) {
+    HostBreakPending = true;
+  } else if (keyPush != 0xE0) {
+    bool keyDown = !HostBreakPending;
+    HostBreakPending = false;
+
+    if (keyPush == 0x14)
+      HostCtrlDown = keyDown;
+    else if (keyPush == 0x11)
+      HostAltDown = keyDown;
+    else if (keyPush == 0x71) {
+      HostDeleteDown = keyDown;
+      if (keyDown && HostCtrlDown && HostAltDown) {
+        HostDeleteDown = false;
+        HostCtrlDown = false;
+        HostAltDown = false;
+        HostDiskManagerTrigger();
+      }
+    }
+
+    if (keyPush == 0x14 || keyPush == 0x11 || keyPush == 0x71) {
+      // These host-only keys are not Apple II input. Clear any E0/F0 prefix
+      // retained by the legacy parser so the next ordinary key starts cleanly.
+      keyboard_mbyte = 0;
+      keyboard_data[0] = 0;
+      keyboard_data[1] = 0;
+      keyboard_data[2] = 0;
+      return;
+    }
+  }
 
   keyboard_data[2] = keyPush;
     

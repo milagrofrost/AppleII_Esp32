@@ -34,11 +34,9 @@
 #define AD_ZPGY	0x0D
 
 // SR Flag Modes
-#define FL_NONE 0x00
 #define FL_Z 	  0x20
 #define FL_ZN 	0xA0
 #define FL_ZNC	0xB0
-#define FL_ZC 	0x30
 #define FL_ALL	0xF0
 
 //Unimplemented ops
@@ -75,6 +73,28 @@ const unsigned char flags[] PROGMEM = {
 	AD_REL, FL_ZNC|AD_INDY, UNDF, UNDF, UNDF, FL_ZNC|AD_ZPGX, FL_ZN|AD_ZPGX, UNDF, AD_IMP, FL_ZNC|AD_ABSY, UNDF, UNDF, UNDF, FL_ZNC|AD_ABSX, FL_ZN|AD_ABSX, UNDF,
 	FL_ZNC|AD_IMM, FL_ALL|AD_INDX, UNDF, UNDF, FL_ZNC|AD_ZPG, FL_ALL|AD_ZPG, FL_ZN|AD_ZPG, UNDF, FL_ZN|AD_IMP, FL_ALL|AD_IMM, AD_IMP, UNDF, FL_ZNC|AD_ABS, FL_ALL|AD_ABS,	FL_ZN|AD_ABS, UNDF,
 	AD_REL, FL_ALL|AD_INDY, UNDF, UNDF, UNDF, FL_ALL|AD_ZPGX, FL_ZN|AD_ZPGX, UNDF, AD_IMP, FL_ALL|AD_ABSY, UNDF, UNDF, UNDF, FL_ALL|AD_ABSX, FL_ZN|AD_ABSX, UNDF
+};
+
+// NMOS 6502 base cycle counts. Page-crossing and taken-branch penalties are
+// added separately by execCode(). Values for unsupported opcodes keep timing
+// deterministic if software probes or executes one.
+const unsigned char opcodeCycles[256] PROGMEM = {
+  7,6,2,8,3,3,5,5,3,2,2,2,4,4,6,6,
+  2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+  6,6,2,8,3,3,5,5,4,2,2,2,4,4,6,6,
+  2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+  6,6,2,8,3,3,5,5,3,2,2,2,3,4,6,6,
+  2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+  6,6,2,8,3,3,5,5,4,2,2,2,5,4,6,6,
+  2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+  2,6,2,6,3,3,3,3,2,2,2,2,4,4,4,4,
+  2,6,2,6,4,4,4,4,2,5,2,5,5,5,5,5,
+  2,6,2,6,3,3,3,3,2,2,2,2,4,4,4,4,
+  2,5,2,5,4,4,4,4,2,4,2,4,4,4,4,4,
+  2,6,2,8,3,3,5,5,2,2,2,2,4,4,6,6,
+  2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+  2,6,2,8,3,3,5,5,2,2,2,2,4,4,6,6,
+  2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7
 };
 
 // CPU registers
@@ -128,7 +148,9 @@ void push8(unsigned char pushval) {
 
 /***************************************************************************************************************************************/
 unsigned short pull16() {
-  value16 = read8(STP_BASE + (++STP)) | ((unsigned short)read8(STP_BASE + (++STP))<< 8);
+  unsigned char low = read8(STP_BASE + (++STP));
+  unsigned char high = read8(STP_BASE + (++STP));
+  value16 = low | ((unsigned short) high << 8);
   return value16;
 }
 
@@ -156,9 +178,13 @@ void initCode() {
 /***************************************************************************************************************************************/
 void execCode() {
 
+    unsigned char instructionCycles;
+    bool pageCrossed = false;
+
     // Get opcode / addressing mode
     opcode = read8(PC++);
     opflags = flags[opcode];
+    instructionCycles = pgm_read_byte_near(opcodeCycles + opcode);
   
     // Addressing modes
     switch(opflags&0x0F) {
@@ -168,11 +194,15 @@ void execCode() {
         PC += 2;
         break;
       case AD_ABSX:
-        argument_addr = read16(PC) + (unsigned short)X;
+        value16 = read16(PC);
+        argument_addr = value16 + (unsigned short)X;
+        pageCrossed = (value16 & 0xFF00) != (argument_addr & 0xFF00);
         PC += 2;
         break;
       case AD_ABSY:
-        argument_addr = read16(PC) + (unsigned short)Y;
+        value16 = read16(PC);
+        argument_addr = value16 + (unsigned short)Y;
+        pageCrossed = (value16 & 0xFF00) != (argument_addr & 0xFF00);
         PC += 2;
         break;
       case AD_IMM:
@@ -193,7 +223,9 @@ void execCode() {
         argument_addr = (unsigned short)read8(PC++);
         value16 = (argument_addr&0xFF00) | ((argument_addr+1)&0x00FF); // Page wrap
         argument_addr = (unsigned short)read8(argument_addr) | ((unsigned short)read8(value16) << 8);
+        value16 = argument_addr;
         argument_addr += Y;
+        pageCrossed = (value16 & 0xFF00) != (argument_addr & 0xFF00);
         break;
       case AD_REL:
         argument_addr = (unsigned short)read8(PC++);
@@ -208,6 +240,20 @@ void execCode() {
       case AD_ZPGY:
         argument_addr = ((unsigned short)read8(PC++) + (unsigned short)Y)&0xFF;
         break;
+      }
+
+      if (pageCrossed) {
+        switch (opcode) {
+          case 0x11: case 0x19: case 0x1D:
+          case 0x31: case 0x39: case 0x3D:
+          case 0x51: case 0x59: case 0x5D:
+          case 0x71: case 0x79: case 0x7D:
+          case 0xB1: case 0xB9: case 0xBC: case 0xBD: case 0xBE:
+          case 0xD1: case 0xD9: case 0xDD:
+          case 0xF1: case 0xF9: case 0xFD:
+            instructionCycles++;
+            break;
+        }
       }
 
       //opcodes
@@ -262,19 +308,35 @@ void execCode() {
           break;
         //BCC
         case 0x90:
-          if(!(SR&SR_CARRY)) PC += argument_addr;
+          if(!(SR&SR_CARRY)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BCS
         case 0xB0:
-          if((SR&SR_CARRY)) PC += argument_addr;
+          if((SR&SR_CARRY)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BEQ
         case 0xF0:
-          if((SR&SR_ZERO)) PC += argument_addr;
+          if((SR&SR_ZERO)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BNE
         case 0xD0:
-          if(!(SR&SR_ZERO)) PC += argument_addr;
+          if(!(SR&SR_ZERO)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BIT
         case 0x24:
@@ -291,11 +353,19 @@ void execCode() {
           break;
         //BMI
         case 0x30:
-          if((SR&SR_NEG)) PC += argument_addr;
+          if((SR&SR_NEG)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BPL
         case 0x10:
-          if(!(SR&SR_NEG)) PC += argument_addr;
+          if(!(SR&SR_NEG)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BRK
         case 0x00:
@@ -307,11 +377,19 @@ void execCode() {
           break;
         //BVC
         case 0x50:
-          if(!(SR&SR_OVER)) PC += argument_addr;
+          if(!(SR&SR_OVER)) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //BVS
         case 0x70:
-          if(SR&SR_OVER) PC += argument_addr;
+          if(SR&SR_OVER) {
+            value16 = PC;
+            PC += argument_addr;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
           break;
         //CLC
         case 0x18:
@@ -669,4 +747,7 @@ void execCode() {
         setflags();
         break;
       }
+
+    cycle += instructionCycles;
+    TotalCycles += instructionCycles;
 }

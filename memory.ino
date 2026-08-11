@@ -811,7 +811,25 @@ const unsigned char ROM[] PROGMEM = { //$D000 - FFFF
 unsigned char memlcramr;                /* read LC RAM or ROM?                                  */
 unsigned char memlcramw;                /* write LC RAM or ROM?                                 */
 unsigned char memlcbank2;               /* read from LC bank 1 or LC bank 2                     */
+static bool memlcprewrite;               /* first odd-switch access arms LC writes               */
+
+void ResetMemorySoftSwitches() {
+  // Power-on state: motherboard ROM visible and language-card writes locked.
+  // This must happen before reading the reset vector for a newly selected game.
+  memlcramr = 0;
+  memlcramw = 0;
+  memlcbank2 = 0;
+  memlcprewrite = false;
+}
 int k=0;
+
+static unsigned int LanguageCardIndex(unsigned short address) {
+  // A 16K language card has two independent 4K banks at $D000-$DFFF and
+  // one shared 8K region at $E000-$FFFF.
+  if (address < 0xE000)
+    return (memlcbank2 ? 0x1000 : 0x0000) + (address - 0xD000);
+  return 0x2000 + (address - 0xE000);
+}
 
 /***************************************************************************************************************************************/
 
@@ -833,7 +851,7 @@ unsigned char read8(unsigned short address) {
       if (!memlcramr) 
         return ROM[address-0xD000];
       else 
-        return RAMEXT[address-0xD000];
+        return RAMEXT[LanguageCardIndex(address)];
   } else {
     // Keyboard Data
     if(address == 0xC000) return keyboard_read(); else
@@ -846,7 +864,7 @@ unsigned char read8(unsigned short address) {
     else
     // Speaker toggle
     if(address == 0xC030) speaker_toggle(); else
-		/* Video resolução */
+		/* Video resolution */
 		if (address >= 0xC050 && address <= 0xC05F)
 			CheckVideoIO (address);  else
 		/* Bank Memory 1/2 */
@@ -887,7 +905,7 @@ void write8(unsigned short address, unsigned char value) {
   else if (page >= 0xD0)
   {
   	if (memlcramw)
-  		RAMEXT[address - 0xD000] = value;
+		RAMEXT[LanguageCardIndex(address)] = value;
   }
   else
   {
@@ -897,10 +915,14 @@ void write8(unsigned short address, unsigned char value) {
   		// Speaker toggle
   		if (address == 0xC030) speaker_toggle();
   		else
-  			/*Video resolução */
+			/* Video resolution */
   			if (address >= 0xC050 && address <= 0xC05F)
   				CheckVideoIO(address);
   			else
+				/* Language-card soft switches respond to writes too. */
+				if (address >= 0xC080 && address <= 0xC08F)
+					CheckBankMemoIO(address);
+				else
   				/*Slot #6 Softswitches */
   				if (address >= 0xC0E0 && address <= 0xC0EF)
   					WriteDiskIO(address, value);
@@ -912,87 +934,20 @@ void write8(unsigned short address, unsigned char value) {
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
-void write16(unsigned short address, unsigned short value) {
-   write8(address, value&0x00FF);
-   write8(address+1, (value>>8)&0x00FF);
-}
-
-/***************************************************************************************************************************************/
-
-/***************************************************************************************************************************************/
 void CheckBankMemoIO(word Address) {
-  switch (Address)
-  {
-  	case 0xc080:
-  	case 0xc084:
-  		{
-  			memlcbank2 = 0x80; /*Bank 2 */
-  			memlcramr = 0x80; /*Read Bank */
-  			memlcramw = 0; /*Write Rom */
-  			return;
-  		}
+  unsigned char mode = Address & 0x03;
 
-  	case 0xc081:
-  	case 0xc085:
-  		{
-  			memlcbank2 = 0x80; /*Bank 2 */
-  			memlcramr = 0; /*Read Rom */
-  			memlcramw = 0x80; /*Write Bank */
-  			return;
-  		}
+  // $C080-$C087 select bank 2; $C088-$C08F select bank 1.
+  memlcbank2 = (Address & 0x08) ? 0x00 : 0x80;
+  memlcramr = (mode == 0 || mode == 3) ? 0x80 : 0x00;
 
-  	case 0xc082:
-  	case 0xc086:
-  		{
-  			memlcbank2 = 0x80; /*Bank 2 */
-  			memlcramr = 0; /*Read Rom */
-  			memlcramw = 0; /*Write Rom */
-  			return;
-  		}
-
-  	case 0xc083:
-  	case 0xc087:
-  		{
-  			memlcbank2 = 0x80; /*Bank 2 */
-  			memlcramr = 0x80; /*Read Bank */
-  			memlcramw = 0x80; /*Write Bank */
-  			return;
-  		}
-
-  	case 0xc088:
-  	case 0xc08c:
-  		{
-  			memlcbank2 = 0; /*Bank 1 */
-  			memlcramr = 0x80; /*Read Bank */
-  			memlcramw = 0; /*Write Rom */
-  			return;
-  		}
-
-  	case 0xc089:
-  	case 0xc08d:
-  		{
-  			memlcbank2 = 0; /*Bank 1 */
-  			memlcramr = 0; /*Read Rom */
-  			memlcramw = 0x80; /*Write Bank */
-  			return;
-  		}
-
-  	case 0xc08a:
-  	case 0xc08e:
-  		{
-  			memlcbank2 = 0; /*Bank 1 */
-  			memlcramr = 0; /*Read Rom */
-  			memlcramw = 0; /*Write Rom */
-  			return;
-  		}
-
-  	case 0xc08b:
-  	case 0xc08f:
-  		{
-  			memlcbank2 = 0; /*Bank 1 */
-  			memlcramr = 0x80; /*Read Bank */
-  			memlcramw = 0x80; /*Write Bank */
-  			return;
-  		}
+  // Hardware requires two consecutive accesses to an odd LC switch before
+  // writes are enabled. Accessing an even switch immediately protects RAM.
+  if (Address & 0x01) {
+    memlcramw = memlcprewrite ? 0x80 : 0x00;
+    memlcprewrite = true;
+  } else {
+    memlcramw = 0x00;
+    memlcprewrite = false;
   }
 }
