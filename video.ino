@@ -90,11 +90,22 @@ static unsigned int hresaddr[24] = {
         0x0050, 0x00d0, 0x0150, 0x01d0, 0x0250, 0x02d0, 0x0350, 0x03d0
 };
 
-static unsigned char dhrescol[16] = {
-        COL_LGR0, COL_LGR2, COL_LGR4, COL_LGR6,
-        COL_LGR8, COL_LGRA, COL_LGRC, COL_LGRE,
-        COL_LGR1, COL_LGR3, COL_LGR5, COL_LGR7,
-        COL_LGR9, COL_LGRB, COL_LGRD, COL_LGRF
+static unsigned short cachedHiresPage = 0;
+static bool hiresCacheValid = false;
+static unsigned short cachedTextPage = 0;
+static bool textCacheValid = false;
+static unsigned char cachedFlashChar = 0;
+static unsigned short cachedLoresPage = 0;
+static bool loresCacheValid = false;
+
+// The Apple II lo-res values are composite-video colors. VGA16 cannot
+// reproduce every shade exactly, but this preserves their color families and
+// is far closer than treating every non-black value as white.
+static Color const loresPalette[16] = {
+  Color::Black,         Color::Magenta,       Color::Blue,          Color::BrightMagenta,
+  Color::Green,         Color::White,         Color::Cyan,          Color::BrightBlue,
+  Color::Yellow,        Color::BrightRed,     Color::BrightBlack,   Color::BrightMagenta,
+  Color::BrightGreen,   Color::BrightYellow,  Color::BrightCyan,    Color::BrightWhite
 };
 
 /***************************************************************************************************************************************/
@@ -103,6 +114,9 @@ static unsigned char dhrescol[16] = {
 void virtreset() {
 
   gm = 0;
+  textCacheValid = false;
+  loresCacheValid = false;
+  hiresCacheValid = false;
   virtsetmode();
 } /* virtreset */
 
@@ -124,187 +138,158 @@ void virtline(unsigned int rastline)
 	unsigned int val, val1, valBits;
 	unsigned char bit, bytes;
 
-	switch (virtmodedown)
+	unsigned int displayMode = virtmodedown;
+	if (virtsplit && rastline * 8 >= virtsplit)
+		displayMode = modetext40;
+
+	switch (displayMode)
 	{
 		case modetext40:
 			/*text 40 column */
+			if (cachedFlashChar != flashChar) {
+				cachedFlashChar = flashChar;
+				textCacheValid = false;
+			}
+			if (cachedTextPage != virttextpage) {
+				cachedTextPage = virttextpage;
+				textCacheValid = false;
+			}
 			addr = textAddr[rastline] + virttextpage;
 			for (bytes = 0; bytes < 40; bytes++)
 			{
 				val = RAM[addr];
-				if (val != RAM_TXT_BACK[addr - virttextpage] || (val & 0xC0) == 0x40)
+				if (!textCacheValid || val != RAM_TXT_BACK[addr - virttextpage])
 				{ 
 					RAM_TXT_BACK[addr - virttextpage] = val;
-					// imprime oito linhas do caracter
+					// Draw the character's eight scan lines
 					for (int line = 0; line < 8; line++)
 					{
 						if (val >= 128)   
 						{
-              // Caracteres normais
+              // Normal characters
 							valBits = AppleFont[(((val + (val - 128<' ' ? 64 : 0)) & 0x7f) << 3) | line];
 						}
 						else
 						{
 							if (val >= 64) {
-                // Caracteres normais
+                // Normal characters
                 val1 = val - 0x40;  inverse = flashChar;
               }
 							else
 							//if (val < 64) 
               {
-                // Caracteres inverse
+                // Inverse characters
                 val1 = val + 0x40; inverse = 0xFF;
               } 
 							valBits = AppleFont[(val1 << 3) | line] ^ inverse;
 						}
 
-						// imprime sete pixels do caracter
+						// Draw the character's seven pixels
 						x = bytes * 7;
 						y = (rastline *8) + line;
 						for (bit = 128; bit > 1; bit = bit >> 1)
 						{
-							if (valBits & bit)
-                canvas.setPenColor(COL_HGR7); // White
-							else
-								canvas.setPenColor(COL_HGR0); // Black
-							canvas.setPixel(x, y);
+							canvas.setPixel(x, y, (valBits & bit) ? COL_HGR7 : COL_HGR0);
 							x++; /*next pixel */
 						}	// for bit 
 					}	// for line
 				}	// for bytes
 				addr++;
 			}
+			if (rastline == 23)
+				textCacheValid = true;
 			return;
 
 		case modelres40:
 			/*lores */
+			if (cachedLoresPage != virttextpage) {
+				cachedLoresPage = virttextpage;
+				loresCacheValid = false;
+			}
 			addr = textAddr[rastline] + virttextpage;
 			for (bytes = 0; bytes < 40; bytes++)
 			{
 			  val = RAM[addr];
-					// imprime oito linhas do caracter
+				if (loresCacheValid && val == RAM_TXT_BACK[addr - virttextpage]) {
+					addr++;
+					continue;
+				}
+				RAM_TXT_BACK[addr - virttextpage] = val;
+					// Draw the character's eight scan lines
 				for (int line = 0; line < 8; line++)
 				{
 					if (line < 4)
-						val1 = (val & 0xf) + COL_LGR0;
+						val1 = val & 0xf;
 					else
-						val1 = (val >> 4) + COL_LGR0;
-					// imprime sete pixels do caracter
+						val1 = val >> 4;
+					// Draw the character's seven pixels
 					x = bytes * 7;
 					y = (rastline *8) + line;
 					for (bit = 0; bit < 7; bit++)
 					{
-						if (val1 != 0)
-							canvas.setPenColor(255, 255, 255);
-						else
-							canvas.setPenColor(0, 0, 0);
-						canvas.setPixel(x, y);
+						canvas.setPixel(x, y, loresPalette[val1]);
 						x++; /*next pixel */
 					}	// for bit 
 				}	// for line
 				addr++;
 			}
+			if (rastline == (virtsplit ? virtsplit / 8 - 1 : 23))
+				loresCacheValid = true;
 			return;			
 
 		case modehres:
 			/*hires */
+			if (cachedHiresPage != virthrespage) {
+				cachedHiresPage = virthrespage;
+				hiresCacheValid = false;
+			}
 			for (int line = 0; line < 8; line++)
 			{
 				addr = hresaddr[rastline] + hreslineaddr[line] + virthrespage;
+				bool previousByteChanged = false;
 				for (bytes = 0; bytes < 40; bytes++)
 				{
+					unsigned int cacheIndex = addr - virthrespage;
+					// Cache exactly the byte used for this draw. The CPU updates RAM on
+					// the other core; rereading it after drawing could incorrectly mark
+					// a newer, never-rendered value as clean.
+					unsigned char currentByte = RAM[addr];
+					bool byteChanged = !hiresCacheValid || currentByte != RAM_HGR_BACK[cacheIndex];
+					bool nextByteChanged = bytes < 39 &&
+						(!hiresCacheValid || RAM[addr + 1] != RAM_HGR_BACK[cacheIndex + 1]);
+
+					// Artifact colors at a byte boundary depend on the neighboring
+					// byte. Redraw this group if it or either neighbor changed.
+					if (!byteChanged && !previousByteChanged && !nextByteChanged) {
+						addr++;
+						previousByteChanged = false;
+						continue;
+					}
+
 					x = bytes * 7;
 					y = (rastline *8) + line;
 					val = (((unsigned char) RAM[addr - 1] & 0x60) >> 5) |
-						    (((unsigned char) RAM[addr] & 0x7f) << 2) |
+						    ((currentByte & 0x7f) << 2) |
 						    (((unsigned char) RAM[addr + 1] & 0x3) << 9);
-					if ((bytes & 1) == 0)
-					{ /*even column */
-						if (bytes == 0)
-						{
-							val &= 0x7fc; /*drop surrounding bits at left border */
-						}
+					if (bytes == 0)
+						val &= 0x7fc; /* drop surrounding bits at left border */
+					else if (bytes == 39)
+						val &= 0x1ff; /* drop surrounding bits at right border */
 
-						if (RAM[addr] & 0x80)
-						{
-							canvas.setPenColor(colourtabe2[(val >> 1) & 7]);	// colourtabe2
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo2[(val >> 2) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe2[(val >> 3) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo2[(val >> 4) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe2[(val >> 5) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo2[(val >> 6) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe2[(val >> 7) & 7]);
-							canvas.setPixel(x++, y);
-						}
-						else
-						{
-							canvas.setPenColor(colourtabe[(val >> 1) & 7]);	// colourtabe
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo[(val >> 2) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe[(val >> 3) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo[(val >> 4) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe[(val >> 5) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo[(val >> 6) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe[(val >> 7) & 7]);
-							canvas.setPixel(x++, y);
-						}
+					Color const * evenPalette = currentByte & 0x80 ? colourtabe2 : colourtabe;
+					Color const * oddPalette = currentByte & 0x80 ? colourtabo2 : colourtabo;
+					for (int pixel = 0; pixel < 7; pixel++) {
+						Color const * palette = ((x + pixel) & 1) ? oddPalette : evenPalette;
+						canvas.setPixel(x + pixel, y, palette[(val >> (pixel + 1)) & 7]);
 					}
-					else
-					{ /*odd column */
-						if (bytes == 39)
-						{
-							val &= 0x1ff; /*drop surrounding bits at right border */
-						}
 
-						if (RAM[addr] & 0x80)
-						{
-							canvas.setPenColor(colourtabo2[(val >> 1) & 7]);	// colourtabo2
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe2[(val >> 2) & 7]);	// colourtabe2
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo2[(val >> 3) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe2[(val >> 4) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo2[(val >> 5) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe2[(val >> 6) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo2[(val >> 7) & 7]);
-							canvas.setPixel(x++, y);
-						}
-						else
-						{
-							canvas.setPenColor(colourtabo[(val >> 1) & 7]);	// colourtabo
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe[(val >> 2) & 7]);	// colourtabe
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo[(val >> 3) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe[(val >> 4) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo[(val >> 5) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabe[(val >> 6) & 7]);
-							canvas.setPixel(x++, y);
-							canvas.setPenColor(colourtabo[(val >> 7) & 7]);
-							canvas.setPixel(x++, y);
-						}
-					}
+					RAM_HGR_BACK[cacheIndex] = currentByte;
+					previousByteChanged = byteChanged;
 					addr++;
 				} /*for bytes */
 			} /*for lines */
+			if (rastline == (virtsplit ? virtsplit / 8 - 1 : 23))
+				hiresCacheValid = true;
 			return;
 	} /*switch */
 } /*virtline */ 
@@ -386,23 +371,19 @@ void CheckVideoIO(word Address) {
 /***************************************************************************************************************************************/
 void virtsetmode() {
 
+  unsigned int previousMode = virtmodedown;
+  unsigned int previousSplit = virtsplit;
+  unsigned int previousTextPage = virttextpage;
+  unsigned int previousHiresPage = virthrespage;
+
   if (gm & GRX) {
     /* set the display modes for both parts of the screen */
     if (gm & HRG) {
-        if (gm & SPL) {
-          virtmodedown = modetext40;
-          virtsplit = 160;
-        } else {
-          virtmodedown = modehres;
-          virtsplit = 192;
-        }
+        virtmodedown = modehres;
+        virtsplit = (gm & SPL) ? 160 : 0;
     } else {
-      virtsplit = 0;
-      if (gm & SPL) {
-        virtmodedown = modetext40;
-      } else {
-        virtmodedown = modelres40;
-      }
+      virtmodedown = modelres40;
+      virtsplit = (gm & SPL) ? 160 : 0;
     }
   } else {
     virtsplit = 0;
@@ -411,13 +392,21 @@ void virtsetmode() {
 
   if (!(gm & PG2)) {
     /* set the visible page */
-    flagPage1 = true;
     virttextpage = 0x400;
     virthrespage = 0x2000;
   } else {
-    flagPage1 = false;
     virttextpage = 0x800;
     virthrespage = 0x4000;
+  }
+
+  // Another display mode overwrites the VGA framebuffer. Force one complete
+  // HGR repaint when returning to graphics, even if Apple video RAM itself did
+  // not change while text or lo-res was visible.
+  if (previousMode != virtmodedown || previousSplit != virtsplit ||
+      previousTextPage != virttextpage || previousHiresPage != virthrespage) {
+    textCacheValid = false;
+    loresCacheValid = false;
+    hiresCacheValid = false;
   }
 
 

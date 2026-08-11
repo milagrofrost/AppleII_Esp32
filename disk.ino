@@ -23,52 +23,205 @@
 #include <dirent.h>
 #include <sys/stat.h>
 extern "C" {
-  #include "esp_spiram.h"
+  #include "esp32/spiram.h"
 }
 
-#ifdef RESCUE_RAIDERS
-  #include "diskRescueRaiders.h"
-#endif
-
-#ifdef GALAXIAN
-  #include "diskGalaxian.h"
-#endif
-
-#ifdef CHOPLIFTER
-  #include "diskChoplifter.h"
-#endif
-
-#ifdef CANNONBALL_BLITZ
-  #include "diskCannonBallBlitz.h"
-#endif
-
-#ifdef CASTLE_WOLFENSTEIN
-  #include "diskCastleWolfestein.h"
-#endif
-
-#ifdef LOADRUNNER
-  #include "diskLoadRunner.h"
-#endif
-
 unsigned long cycle;
+uint64_t TotalCycles;
 
 static const size_t DISK_IMAGE_SIZE = 143360;
+static const int DISK_TRACK_COUNT = 35;
+static const int MAX_DISK_HALF_TRACK = (DISK_TRACK_COUNT - 1) * 2;
 static const char * DISK_MOUNT_PATH = "/SD";
 static const char * DISK_DIRECTORY = "/SD/apple2/disks";
 static const char * LEGACY_DISK_PATH = "/SD/apple2/dos33.dsk";
-static const int MAX_DISK_IMAGES = 32;
-static const int MAX_VISIBLE_DISKS = 18;
+static const char * DISK_INDEX_PATH = "/SD/apple2/disks/apple2-index.txt";
+static const char * DISK_INDEX_HEADER = "ESPAPPLEII-DISK-INDEX-1";
+static const int MAX_DISK_IMAGES_PSRAM = 4096;
+static const int MAX_DISK_IMAGES_FALLBACK = 32;
+static const int MAX_DISK_SCAN_DEPTH = 8;
+static const size_t MAX_DISK_PATH = 384;
 unsigned char * DiskImage = NULL;
+unsigned char * DriveDiskImage[2] = { NULL, NULL };
+static bool DiskPSRAMReady = false;
+static bool DriveDiskImageHeapAllocated[2] = { false, false };
 char DiskLoadError[96] = "Disk image has not been loaded";
 char LoadedDiskName[64] = "";
+static unsigned int DiskReadTraceCount = 0;
+static unsigned int DiskTrackTraceCount = 0;
+#if ENABLE_DISK_DIAGNOSTICS
+static unsigned int DiskIOTraceCount = 0;
+static unsigned long DiskHeadPositionChangedAt = 0;
+#endif
 
 struct DiskMenuEntry {
-  char path[128];
-  char name[64];
+  uint32_t pathOffset;
+  uint16_t nameOffset;
 };
 
-static DiskMenuEntry DiskMenu[MAX_DISK_IMAGES];
+static DiskMenuEntry DiskMenuFallback[MAX_DISK_IMAGES_FALLBACK];
+static char DiskStringFallback[MAX_DISK_IMAGES_FALLBACK * MAX_DISK_PATH];
+static DiskMenuEntry * DiskMenu = DiskMenuFallback;
+static char * DiskStringPool = DiskStringFallback;
+static size_t DiskStringPoolCapacity = sizeof(DiskStringFallback);
+static size_t DiskStringPoolUsed = 0;
+static int DiskMenuCapacity = MAX_DISK_IMAGES_FALLBACK;
 static int DiskMenuCount = 0;
+static uint16_t DiskMenuMatchesFallback[MAX_DISK_IMAGES_FALLBACK];
+static uint16_t * DiskMenuMatches = DiskMenuMatchesFallback;
+static int DiskMenuMatchCapacity = MAX_DISK_IMAGES_FALLBACK;
+static int DiskMenuMatchCount = 0;
+static char DiskMenuSearch[32] = "";
+static int DiskMenuMarqueeOffset = 0;
+static unsigned long DiskMenuMarqueeLastStep = 0;
+static unsigned long DiskMenuMarqueeResumeAt = 0;
+static unsigned char * DiskIndexScratch = NULL;
+static size_t DiskIndexScratchCapacity = 0;
+static bool DiskCatalogReady = false;
+static unsigned int DiskScanDirectoryCount = 0;
+static unsigned int DiskScanPathTooLongCount = 0;
+static unsigned int DiskScanCapacitySkippedCount = 0;
+static unsigned int DiskScanEntryCount = 0;
+static unsigned long DiskScanStartedAt = 0;
+static unsigned long DiskScanLastSerialProgressAt = 0;
+static unsigned long DiskScanLastVGAProgressAt = 0;
+
+static size_t ReadFileThroughInternalBuffer(FILE * file, unsigned char * destination,
+                                            size_t size, const char * label) {
+  const size_t transferBufferSize = 8192;
+  unsigned char * transferBuffer = (unsigned char *) malloc(transferBufferSize);
+  if (!transferBuffer) {
+    DEBUG_PRINTF("[SD] No staging RAM for %s; using direct transfer\n", label);
+    return fread(destination, 1, size, file);
+  }
+
+  size_t total = 0;
+  unsigned long startedAt = millis();
+  while (total < size) {
+    size_t requested = size - total;
+    if (requested > transferBufferSize)
+      requested = transferBufferSize;
+    size_t received = fread(transferBuffer, 1, requested, file);
+    if (!received)
+      break;
+    memcpy(destination + total, transferBuffer, received);
+    total += received;
+  }
+  free(transferBuffer);
+  DEBUG_PRINTF("[SD] Buffered %s transfer: %u bytes in %lums\n",
+               label, (unsigned) total, millis() - startedAt);
+  return total;
+}
+
+static void ReportDiskScanProgress(const char * currentPath, bool force = false) {
+  unsigned long now = millis();
+  bool reportSerial = force || now - DiskScanLastSerialProgressAt >= 1000;
+  bool reportVGA = force || now - DiskScanLastVGAProgressAt >= 5000;
+  if (!reportSerial && !reportVGA)
+    return;
+
+  const char * folder = currentPath ? strrchr(currentPath, '/') : NULL;
+  folder = folder ? folder + 1 : (currentPath ? currentPath : "");
+  char shortFolder[43];
+  snprintf(shortFolder, sizeof(shortFolder), "%.42s", folder);
+
+  if (reportSerial) {
+    DiskScanLastSerialProgressAt = now;
+    DEBUG_PRINTF("[SD] Scanning: dirs=%u entries=%u disks=%d elapsed=%lums folder=%s\n",
+                 DiskScanDirectoryCount, DiskScanEntryCount, DiskMenuCount,
+                 now - DiskScanStartedAt, shortFolder);
+  }
+
+  if (!reportVGA)
+    return;
+  DiskScanLastVGAProgressAt = now;
+
+  fabgl::Point savedOrigin = canvas.getOrigin();
+  canvas.setOrigin(0, 0);
+  canvas.setBrushColor(Color::Black);
+  canvas.fillRectangle(0, 0, canvas.getWidth() - 1, 92);
+  canvas.setPenColor(Color::BrightYellow);
+  canvas.drawText(20, 18,
+                  currentPath && !strcmp(currentPath, "PREBUILT INDEX")
+                    ? "LOADING PREBUILT DISK INDEX"
+                    : "SCANNING APPLE II DISK ARCHIVE");
+  canvas.setPenColor(Color::White);
+  char status[64];
+  snprintf(status, sizeof(status), "FOLDERS %u   FILES %u", DiskScanDirectoryCount, DiskScanEntryCount);
+  canvas.drawText(20, 38, status);
+  snprintf(status, sizeof(status), "VALID DSK %d   TIME %lus", DiskMenuCount,
+           (now - DiskScanStartedAt) / 1000UL);
+  canvas.drawText(20, 54, status);
+  canvas.setPenColor(Color::BrightCyan);
+  canvas.drawText(20, 72, shortFolder);
+  canvas.setOrigin(savedOrigin);
+}
+
+static void PrepareDiskMenuStorage() {
+  DiskMenu = DiskMenuFallback;
+  DiskStringPool = DiskStringFallback;
+  DiskStringPoolCapacity = sizeof(DiskStringFallback);
+  DiskStringPoolUsed = 0;
+  DiskMenuCapacity = MAX_DISK_IMAGES_FALLBACK;
+  DiskMenuMatches = DiskMenuMatchesFallback;
+  DiskMenuMatchCapacity = MAX_DISK_IMAGES_FALLBACK;
+  DiskIndexScratch = NULL;
+  DiskIndexScratchCapacity = 0;
+
+  if (!DiskPSRAMReady)
+    return;
+
+  // esp_spiram_get_size() reports all physical PSRAM (8 MB on this board),
+  // but classic ESP32 code can directly address only SOC_EXTRAM_DATA_SIZE
+  // (4 MB). The remaining memory requires the separate himem API.
+  size_t physicalPSRAMSize = esp_spiram_get_size();
+  size_t psramSize = physicalPSRAMSize < SOC_EXTRAM_DATA_SIZE
+                   ? physicalPSRAMSize : SOC_EXTRAM_DATA_SIZE;
+  size_t reservedForDrives = 2 * DISK_IMAGE_SIZE;
+  if (psramSize <= reservedForDrives)
+    return;
+
+  size_t available = psramSize - reservedForDrives;
+  size_t capacity = MAX_DISK_IMAGES_PSRAM;
+  size_t recordBytes = capacity * (sizeof(DiskMenuEntry) + sizeof(uint16_t));
+  if (available <= recordBytes)
+    return;
+  if (capacity < MAX_DISK_IMAGES_FALLBACK)
+    return;
+
+  DiskMenu = (DiskMenuEntry *) ((unsigned char *) SOC_EXTRAM_DATA_LOW + reservedForDrives);
+  DiskMenuCapacity = (int) capacity;
+  DiskMenuMatches = (uint16_t *) ((unsigned char *) DiskMenu
+                    + DiskMenuCapacity * sizeof(DiskMenuEntry));
+  DiskMenuMatchCapacity = DiskMenuCapacity;
+  unsigned char * usedEnd = (unsigned char *) DiskMenuMatches
+                           + DiskMenuMatchCapacity * sizeof(uint16_t);
+  unsigned char * psramEnd = (unsigned char *) SOC_EXTRAM_DATA_LOW + psramSize;
+  DiskStringPool = (char *) usedEnd;
+  DiskStringPoolCapacity = psramEnd - usedEnd;
+  DiskStringPoolUsed = 0;
+  DEBUG_PRINTF("[MEM] Compact disk index in PSRAM: physical=%u mapped=%u capacity=%d record=%u bytes records=%u stringPool=%u bytes\n",
+               (unsigned) physicalPSRAMSize, (unsigned) psramSize,
+               DiskMenuCapacity, (unsigned) sizeof(DiskMenuEntry),
+               (unsigned) recordBytes, (unsigned) DiskStringPoolCapacity);
+}
+
+static const char * DiskEntryPath(int index) {
+  return DiskStringPool + DiskMenu[index].pathOffset;
+}
+
+static const char * DiskEntryName(int index) {
+  return DiskEntryPath(index) + DiskMenu[index].nameOffset;
+}
+
+static void ReleaseDiskIndexScratch() {
+  if (DiskPSRAMReady && DiskStringPool != DiskStringFallback) {
+    unsigned char * psramEnd = (unsigned char *) SOC_EXTRAM_DATA_HIGH;
+    DiskStringPoolCapacity = psramEnd - (unsigned char *) DiskStringPool;
+  }
+  DiskIndexScratch = NULL;
+  DiskIndexScratchCapacity = 0;
+}
 
 static bool HasDSKExtension(const char * name) {
   size_t length = strlen(name);
@@ -81,77 +234,418 @@ static bool HasDSKExtension(const char * name) {
          (extension[3] == 'k' || extension[3] == 'K');
 }
 
-static bool AddDiskMenuEntry(const char * path, const char * name) {
-  if (DiskMenuCount >= MAX_DISK_IMAGES)
-    return false;
-
-  struct stat fileInfo;
-  if (stat(path, &fileInfo) != 0 || !S_ISREG(fileInfo.st_mode))
-    return false;
-  if (fileInfo.st_size != (long) DISK_IMAGE_SIZE) {
-    DEBUG_PRINTF("[SD] Skipping %s: %ld bytes (need %u)\n",
-                 path, (long) fileInfo.st_size, (unsigned) DISK_IMAGE_SIZE);
+static bool AddDiskMenuEntry(const char * path, const char * name, long knownSize = -1) {
+  (void) name;
+  if (DiskMenuCount >= DiskMenuCapacity) {
+    DiskScanCapacitySkippedCount++;
     return false;
   }
 
-  snprintf(DiskMenu[DiskMenuCount].path, sizeof(DiskMenu[DiskMenuCount].path), "%s", path);
-  snprintf(DiskMenu[DiskMenuCount].name, sizeof(DiskMenu[DiskMenuCount].name), "%s", name);
+  long fileSize = knownSize;
+  if (fileSize < 0) {
+    struct stat fileInfo;
+    if (stat(path, &fileInfo) != 0 || !S_ISREG(fileInfo.st_mode))
+      return false;
+    fileSize = fileInfo.st_size;
+  }
+  if (fileSize != (long) DISK_IMAGE_SIZE) {
+    DEBUG_PRINTF("[SD] Skipping %s: %ld bytes (need %u)\n",
+                 path, fileSize, (unsigned) DISK_IMAGE_SIZE);
+    return false;
+  }
+
+  size_t pathBytes = strlen(path) + 1;
+  if (pathBytes > MAX_DISK_PATH || DiskStringPoolUsed > DiskStringPoolCapacity ||
+      pathBytes > DiskStringPoolCapacity - DiskStringPoolUsed) {
+    DiskScanPathTooLongCount++;
+    return false;
+  }
+  char * storedPath = DiskStringPool + DiskStringPoolUsed;
+  memcpy(storedPath, path, pathBytes);
+  const char * storedName = strrchr(storedPath, '/');
+  storedName = storedName ? storedName + 1 : storedPath;
+  DiskMenu[DiskMenuCount].pathOffset = DiskStringPoolUsed;
+  DiskMenu[DiskMenuCount].nameOffset = (uint16_t) (storedName - storedPath);
+  DiskStringPoolUsed += pathBytes;
   DiskMenuCount++;
+  if ((DiskMenuCount % 250) == 0)
+    DEBUG_PRINTF("[SD] Indexed %d disk images in %lums...\n",
+                 DiskMenuCount, millis() - DiskScanStartedAt);
   return true;
 }
 
-static void FindDiskImages() {
+static void ScanDiskDirectory(const char * directoryPath, int depth) {
+  if (depth > MAX_DISK_SCAN_DEPTH || DiskMenuCount >= DiskMenuCapacity)
+    return;
+
+  DIR * directory = opendir(directoryPath);
+  if (!directory)
+    return;
+  DiskScanDirectoryCount++;
+  ReportDiskScanProgress(directoryPath);
+
+  struct dirent * item;
+  while ((item = readdir(directory)) != NULL) {
+    if (!strcmp(item->d_name, ".") || !strcmp(item->d_name, ".."))
+      continue;
+    DiskScanEntryCount++;
+    ReportDiskScanProgress(directoryPath);
+
+    char path[MAX_DISK_PATH];
+    int pathLength = snprintf(path, sizeof(path), "%s/%s", directoryPath, item->d_name);
+    if (pathLength < 0 || pathLength >= (int) sizeof(path)) {
+      DiskScanPathTooLongCount++;
+      continue;
+    }
+
+    bool isDirectory = item->d_type == DT_DIR;
+    bool isRegular = item->d_type == DT_REG;
+    long knownSize = -1;
+    if (item->d_type == DT_UNKNOWN) {
+      struct stat fileInfo;
+      if (stat(path, &fileInfo) != 0)
+        continue;
+      isDirectory = S_ISDIR(fileInfo.st_mode);
+      isRegular = S_ISREG(fileInfo.st_mode);
+      knownSize = fileInfo.st_size;
+    }
+
+    if (isDirectory) {
+      ScanDiskDirectory(path, depth + 1);
+    } else if (isRegular && HasDSKExtension(item->d_name)) {
+      AddDiskMenuEntry(path, item->d_name, knownSize);
+    }
+
+    if (DiskMenuCount >= DiskMenuCapacity)
+      break;
+  }
+  closedir(directory);
+}
+
+static int CompareDiskMenuEntries(const void * left, const void * right) {
+  const DiskMenuEntry * a = (const DiskMenuEntry *) left;
+  const DiskMenuEntry * b = (const DiskMenuEntry *) right;
+  const char * aPath = DiskStringPool + a->pathOffset;
+  const char * bPath = DiskStringPool + b->pathOffset;
+  return strcasecmp(aPath + a->nameOffset, bPath + b->nameOffset);
+}
+
+static bool LoadDiskIndex() {
+  // FabGL drawing and the FAT/newlib FILE implementation both use FreeRTOS
+  // queues. Finish the progress-screen work before opening the index so a
+  // live FILE mutex is never carried through VGA primitive processing.
+  ReportDiskScanProgress("PREBUILT INDEX", true);
+
+  FILE * indexFile = fopen(DISK_INDEX_PATH, "r");
+  if (!indexFile)
+    return false;
+
+  // The ESP32 FAT stdio layer makes thousands of fgets() calls very costly.
+  // Read the text index in one transfer, then split its lines in spare PSRAM.
+  fseek(indexFile, 0, SEEK_END);
+  long indexSize = ftell(indexFile);
+  rewind(indexFile);
+  if (DiskPSRAMReady && indexSize > 0) {
+    unsigned char * psramEnd = (unsigned char *) SOC_EXTRAM_DATA_HIGH;
+    unsigned char * scratch = psramEnd - ((size_t) indexSize + 1);
+    unsigned char * stringsUsedEnd = (unsigned char *) DiskStringPool + DiskStringPoolUsed;
+    if (scratch > stringsUsedEnd) {
+      DiskIndexScratch = scratch;
+      DiskIndexScratchCapacity = (size_t) indexSize + 1;
+      DiskStringPoolCapacity = scratch - (unsigned char *) DiskStringPool;
+    }
+  }
+  if (DiskIndexScratch && indexSize > 0 && (size_t) indexSize + 1 <= DiskIndexScratchCapacity) {
+    DEBUG_PRINTF("[SD] Loading %ld-byte prebuilt disk index\n", indexSize);
+    size_t bytesRead = ReadFileThroughInternalBuffer(indexFile, DiskIndexScratch,
+                                                     (size_t) indexSize, "index");
+    fclose(indexFile);
+    if (bytesRead != (size_t) indexSize)
+      return false;
+    DiskIndexScratch[indexSize] = '\0';
+
+    char * cursor = (char *) DiskIndexScratch;
+    char * end = cursor + indexSize;
+    char * lineEnd = (char *) memchr(cursor, '\n', end - cursor);
+    if (!lineEnd)
+      return false;
+    *lineEnd = '\0';
+    if (lineEnd > cursor && lineEnd[-1] == '\r')
+      lineEnd[-1] = '\0';
+    if (strcmp(cursor, DISK_INDEX_HEADER) != 0) {
+      DEBUG_PRINTF("[SD] Ignoring incompatible disk index: %s\n", DISK_INDEX_PATH);
+      return false;
+    }
+
+    DEBUG_PRINTLN("[SD] Parsing prebuilt disk index from PSRAM buffer");
+    cursor = lineEnd + 1;
+    while (cursor < end && DiskMenuCount < DiskMenuCapacity) {
+      lineEnd = (char *) memchr(cursor, '\n', end - cursor);
+      if (!lineEnd)
+        lineEnd = end;
+      char savedEnd = *lineEnd;
+      *lineEnd = '\0';
+      size_t length = strlen(cursor);
+      if (length && cursor[length - 1] == '\r')
+        cursor[--length] = '\0';
+      DiskScanEntryCount++;
+      if (length && cursor[0] != '/' && !strstr(cursor, "../") && HasDSKExtension(cursor)) {
+        char path[MAX_DISK_PATH];
+        int pathLength = snprintf(path, sizeof(path), "%s/%s", DISK_DIRECTORY, cursor);
+        if (pathLength >= 0 && pathLength < (int) sizeof(path)) {
+          const char * name = strrchr(cursor, '/');
+          AddDiskMenuEntry(path, name ? name + 1 : cursor, DISK_IMAGE_SIZE);
+        } else {
+          DiskScanPathTooLongCount++;
+        }
+      }
+      *lineEnd = savedEnd;
+      cursor = lineEnd < end ? lineEnd + 1 : end;
+    }
+    DEBUG_PRINTF("[SD] Loaded %d indexed .dsk image(s) in %lums\n",
+                 DiskMenuCount, millis() - DiskScanStartedAt);
+    ReleaseDiskIndexScratch();
+    return DiskMenuCount > 0;
+  }
+
+  char line[384];
+  if (!fgets(line, sizeof(line), indexFile)) {
+    fclose(indexFile);
+    return false;
+  }
+  line[strcspn(line, "\r\n")] = '\0';
+  if (strcmp(line, DISK_INDEX_HEADER) != 0) {
+    DEBUG_PRINTF("[SD] Ignoring incompatible disk index: %s\n", DISK_INDEX_PATH);
+    fclose(indexFile);
+    return false;
+  }
+
+  DEBUG_PRINTF("[SD] Loading prebuilt disk index: %s\n", DISK_INDEX_PATH);
+  while (DiskMenuCount < DiskMenuCapacity && fgets(line, sizeof(line), indexFile)) {
+    size_t length = strcspn(line, "\r\n");
+    bool completeLine = line[length] == '\r' || line[length] == '\n' || feof(indexFile);
+    line[length] = '\0';
+    DiskScanEntryCount++;
+    if (!completeLine || !line[0] || line[0] == '/' || strstr(line, "../") || !HasDSKExtension(line))
+      continue;
+
+    char path[MAX_DISK_PATH];
+    int pathLength = snprintf(path, sizeof(path), "%s/%s", DISK_DIRECTORY, line);
+    if (pathLength < 0 || pathLength >= (int) sizeof(path)) {
+      DiskScanPathTooLongCount++;
+      continue;
+    }
+    const char * name = strrchr(line, '/');
+    name = name ? name + 1 : line;
+    // The desktop generator already checked file size. Avoid thousands of
+    // random FAT metadata reads and validate the selected file when opened.
+    AddDiskMenuEntry(path, name, DISK_IMAGE_SIZE);
+  }
+  fclose(indexFile);
+  DEBUG_PRINTF("[SD] Loaded %d indexed .dsk image(s) in %lums\n",
+               DiskMenuCount, millis() - DiskScanStartedAt);
+  return DiskMenuCount > 0;
+}
+
+void FindDiskImages() {
+  if (DiskCatalogReady && DiskMenuCount > 0) {
+    DEBUG_PRINTF("[SD] Reusing %d cached disk-index entries\n", DiskMenuCount);
+    return;
+  }
+
+  PrepareDiskMenuStorage();
   DiskMenuCount = 0;
+  DiskScanDirectoryCount = 0;
+  DiskScanPathTooLongCount = 0;
+  DiskScanCapacitySkippedCount = 0;
+  DiskScanEntryCount = 0;
+  DiskScanStartedAt = millis();
+  DiskScanLastSerialProgressAt = 0;
+  DiskScanLastVGAProgressAt = 0;
 
   // Keep the milestone-1 location as the default/fallback entry.
   AddDiskMenuEntry(LEGACY_DISK_PATH, "dos33.dsk");
 
-  DIR * directory = opendir(DISK_DIRECTORY);
-  if (!directory) {
-    DEBUG_PRINTF("[SD] Directory %s not found; using legacy disk if available\n", DISK_DIRECTORY);
+  if (LoadDiskIndex()) {
+    DiskCatalogReady = true;
+    DEBUG_PRINTF("[SD] Ready with %d prebuilt index entries (capacity=%d pathTooLong=%u)\n",
+                 DiskMenuCount, DiskMenuCapacity, DiskScanPathTooLongCount);
     return;
   }
 
-  struct dirent * item;
-  while (DiskMenuCount < MAX_DISK_IMAGES && (item = readdir(directory)) != NULL) {
-    if (!HasDSKExtension(item->d_name))
-      continue;
-    char path[128];
-    snprintf(path, sizeof(path), "%s/%s", DISK_DIRECTORY, item->d_name);
-    AddDiskMenuEntry(path, item->d_name);
+  ReleaseDiskIndexScratch();
+
+  DEBUG_PRINTLN("[SD] No usable prebuilt index; falling back to recursive SD scan");
+  ReportDiskScanProgress(DISK_DIRECTORY, true);
+
+  DIR * rootDirectory = opendir(DISK_DIRECTORY);
+  if (!rootDirectory) {
+    DEBUG_PRINTF("[SD] Directory %s not found; using legacy disk if available\n", DISK_DIRECTORY);
+    return;
   }
-  closedir(directory);
+  closedir(rootDirectory);
+  ScanDiskDirectory(DISK_DIRECTORY, 0);
 
   // Alphabetize the games while leaving the legacy DOS disk first.
-  for (int i = 1; i < DiskMenuCount - 1; i++) {
-    for (int j = i + 1; j < DiskMenuCount; j++) {
-      if (strcmp(DiskMenu[i].name, DiskMenu[j].name) > 0) {
-        DiskMenuEntry temporary = DiskMenu[i];
-        DiskMenu[i] = DiskMenu[j];
-        DiskMenu[j] = temporary;
-      }
+  if (DiskMenuCount > 2) {
+    ReportDiskScanProgress("SORTING INDEX", true);
+    qsort(DiskMenu + 1, DiskMenuCount - 1, sizeof(DiskMenuEntry), CompareDiskMenuEntries);
+  }
+  DEBUG_PRINTF("[SD] Found %d valid .dsk image(s) in %u directories in %lums (capacity=%d pathTooLong=%u capacitySkipped=%u)\n",
+               DiskMenuCount, DiskScanDirectoryCount, millis() - DiskScanStartedAt, DiskMenuCapacity,
+               DiskScanPathTooLongCount, DiskScanCapacitySkippedCount);
+  DiskCatalogReady = DiskMenuCount > 0;
+}
+
+static bool ContainsCaseInsensitive(const char * text, const char * query) {
+  if (!query[0])
+    return true;
+  size_t queryLength = strlen(query);
+  for (; *text; text++) {
+    size_t index = 0;
+    while (index < queryLength && text[index] &&
+           tolower((unsigned char) text[index]) == tolower((unsigned char) query[index]))
+      index++;
+    if (index == queryLength)
+      return true;
+  }
+  return false;
+}
+
+static bool FuzzySubsequenceMatch(const char * text, const char * query) {
+  while (*text && *query) {
+    if (tolower((unsigned char) *text) == tolower((unsigned char) *query))
+      query++;
+    text++;
+  }
+  return *query == '\0';
+}
+
+static void RebuildDiskMenuMatches() {
+  DiskMenuMatchCount = 0;
+  // Strong partial-string matches are shown before looser fuzzy matches.
+  for (int pass = 0; pass < 2; pass++) {
+    for (int index = 0; index < DiskMenuCount; index++) {
+      bool substring = ContainsCaseInsensitive(DiskEntryName(index), DiskMenuSearch);
+      bool matches = pass == 0 ? substring
+                               : (!substring && FuzzySubsequenceMatch(DiskEntryName(index), DiskMenuSearch));
+      if (matches && DiskMenuMatchCount < DiskMenuMatchCapacity)
+        DiskMenuMatches[DiskMenuMatchCount++] = (uint16_t) index;
     }
   }
-  DEBUG_PRINTF("[SD] Found %d valid disk image(s)\n", DiskMenuCount);
+}
+
+static int DiskMenuVisibleRows() {
+  const int listTop = 60;
+  const int footerHeight = 22;
+  int rows = (canvas.getHeight() - listTop - footerHeight) / 12;
+  return rows > 0 ? rows : 1;
+}
+
+static int DiskMenuFilenameCharacters() {
+  int characters = (canvas.getWidth() - 20) / 8 - 2;
+  return characters > 0 ? characters : 1;
+}
+
+static void FormatDiskMenuName(char * output, size_t outputSize, const char * name,
+                               int characters, int marqueeOffset) {
+  size_t nameLength = strlen(name);
+  if ((int) nameLength <= characters || marqueeOffset < 0) {
+    snprintf(output, outputSize, "%.*s", characters, name);
+    return;
+  }
+
+  int cycleLength = (int) nameLength + 3;
+  int count = characters;
+  if (count >= (int) outputSize)
+    count = outputSize - 1;
+  for (int index = 0; index < count; index++) {
+    int source = (marqueeOffset + index) % cycleLength;
+    output[index] = source < (int) nameLength ? name[source] : ' ';
+  }
+  output[count] = '\0';
+}
+
+static void ResetDiskMenuMarquee() {
+  DiskMenuMarqueeOffset = 0;
+  DiskMenuMarqueeLastStep = millis();
+  DiskMenuMarqueeResumeAt = DiskMenuMarqueeLastStep + 800;
+}
+
+static void DrawDiskMenuMarqueeRow(int selected) {
+  if (selected < 0 || selected >= DiskMenuMatchCount)
+    return;
+  int visibleRows = DiskMenuVisibleRows();
+  int first = selected >= visibleRows ? selected - visibleRows + 1 : 0;
+  int y = 60 + (selected - first) * 12;
+  int diskIndex = DiskMenuMatches[selected];
+  int filenameCharacters = DiskMenuFilenameCharacters();
+  if ((int) strlen(DiskEntryName(diskIndex)) <= filenameCharacters)
+    return;
+
+  char visibleName[70];
+  FormatDiskMenuName(visibleName, sizeof(visibleName), DiskEntryName(diskIndex),
+                     filenameCharacters, DiskMenuMarqueeOffset);
+  canvas.setBrushColor(Color::BrightGreen);
+  canvas.fillRectangle(20, y, canvas.getWidth() - 1, y + 8);
+  canvas.setPenColor(Color::Black);
+  char line[72];
+  snprintf(line, sizeof(line), "> %s", visibleName);
+  canvas.drawText(20, y, line);
+}
+
+static void FlashSelectedDiskRow(int selected) {
+  if (selected < 0 || selected >= DiskMenuMatchCount)
+    return;
+  int visibleRows = DiskMenuVisibleRows();
+  int first = selected >= visibleRows ? selected - visibleRows + 1 : 0;
+  int y = 60 + (selected - first) * 12;
+  for (int flash = 0; flash < 2; flash++) {
+    canvas.invertRectangle(20, y, canvas.getWidth() - 1, y + 8);
+    delay(75);
+    canvas.invertRectangle(20, y, canvas.getWidth() - 1, y + 8);
+    delay(75);
+  }
+}
+
+static char DiskMenuScancodeToCharacter(int scanCode) {
+  if (scanCode < 0 || scanCode > 0x7F)
+    return 0;
+  unsigned char appleKey = pgm_read_byte_near(scancode_to_apple + scanCode);
+  char character = (char) (appleKey & 0x7F);
+  return character >= 0x20 && character <= 0x7E ? character : 0;
 }
 
 static void DrawDiskMenu(int selected) {
+  int visibleRows = DiskMenuVisibleRows();
   int first = 0;
-  if (selected >= MAX_VISIBLE_DISKS)
-    first = selected - MAX_VISIBLE_DISKS + 1;
-  int last = first + MAX_VISIBLE_DISKS;
-  if (last > DiskMenuCount)
-    last = DiskMenuCount;
+  if (selected >= visibleRows)
+    first = selected - visibleRows + 1;
+  int last = first + visibleRows;
+  if (last > DiskMenuMatchCount)
+    last = DiskMenuMatchCount;
 
   canvas.setBrushColor(Color::Black);
   canvas.clear();
+  DrawVGAAlignmentMarkers();
   canvas.setPenColor(Color::BrightYellow);
   canvas.drawText(20, 15, "APPLE II DISK SELECTOR");
   canvas.setPenColor(Color::White);
-  canvas.drawText(20, 30, "UP/DOWN: SELECT   ENTER: BOOT");
+  canvas.drawText(20, 30, "TYPE TO SEARCH  UP/DOWN  ENTER");
+
+  canvas.setPenColor(Color::BrightCyan);
+  char searchLine[48];
+  int searchCharacters = (canvas.getWidth() - 20) / 8 - 9;
+  if (searchCharacters < 1)
+    searchCharacters = 1;
+  snprintf(searchLine, sizeof(searchLine), "SEARCH: %.*s_", searchCharacters, DiskMenuSearch);
+  canvas.drawText(20, 42, searchLine);
+
+  int filenameCharacters = DiskMenuFilenameCharacters();
 
   for (int index = first; index < last; index++) {
-    int y = 52 + (index - first) * 12;
+    int diskIndex = DiskMenuMatches[index];
+    int y = 60 + (index - first) * 12;
     if (index == selected) {
       canvas.setBrushColor(Color::BrightGreen);
       canvas.setPenColor(Color::Black);
@@ -160,58 +654,126 @@ static void DrawDiskMenu(int selected) {
       canvas.setPenColor(Color::White);
     }
     char line[70];
-    snprintf(line, sizeof(line), "%c %s", index == selected ? '>' : ' ', DiskMenu[index].name);
+    char visibleName[68];
+    FormatDiskMenuName(visibleName, sizeof(visibleName), DiskEntryName(diskIndex),
+                       filenameCharacters, index == selected ? DiskMenuMarqueeOffset : -1);
+    snprintf(line, sizeof(line), "%c %s", index == selected ? '>' : ' ', visibleName);
     canvas.drawText(20, y, line);
   }
 
   canvas.setBrushColor(Color::Black);
   canvas.setPenColor(Color::BrightCyan);
   char status[48];
-  snprintf(status, sizeof(status), "DISK %d OF %d", selected + 1, DiskMenuCount);
-  canvas.drawText(20, 278, status);
+  if (DiskMenuMatchCount)
+    snprintf(status, sizeof(status), "MATCH %d OF %d   TOTAL %d", selected + 1, DiskMenuMatchCount, DiskMenuCount);
+  else
+    snprintf(status, sizeof(status), "NO MATCHES   TOTAL %d", DiskMenuCount);
+  canvas.drawText(20, canvas.getHeight() - 14, status);
 }
 
-static int SelectDiskImage() {
+int SelectDiskImage() {
   if (DiskMenuCount == 1)
     return 0;
 
   auto keyboard = PS2Controller.keyboard();
-  keyboard->enableVirtualKeys(true, true);
   int selected = 0;
+  bool released = false;
+  int exitScanCode = 0;
+  DiskMenuSearch[0] = '\0';
+  RebuildDiskMenuMatches();
+  ResetDiskMenuMarquee();
   DrawDiskMenu(selected);
 
   for (;;) {
-    bool keyDown = false;
-    VirtualKey key = keyboard->getNextVirtualKey(&keyDown);
-    if (!keyDown)
+    if (!keyboard->scancodeAvailable()) {
+      unsigned long now = millis();
+      if ((long) (now - DiskMenuMarqueeResumeAt) >= 0 &&
+          now - DiskMenuMarqueeLastStep >= 250) {
+        DiskMenuMarqueeLastStep = now;
+        DiskMenuMarqueeOffset++;
+        DrawDiskMenuMarqueeRow(selected);
+      }
+      delay(10);
       continue;
-    if (key == fabgl::VK_UP || key == fabgl::VK_KP_UP) {
-      selected = selected > 0 ? selected - 1 : DiskMenuCount - 1;
-      DrawDiskMenu(selected);
-    } else if (key == fabgl::VK_DOWN || key == fabgl::VK_KP_DOWN) {
-      selected = selected + 1 < DiskMenuCount ? selected + 1 : 0;
-      DrawDiskMenu(selected);
-    } else if (key == fabgl::VK_RETURN || key == fabgl::VK_KP_ENTER) {
-      break;
-    } else if (key == fabgl::VK_ESCAPE) {
-      selected = 0;
-      break;
+    }
+    int scanCode = keyboard->getNextScancode();
+    if (scanCode == 0xE0) {
+      continue;
+    }
+    if (scanCode == 0xF0) {
+      released = true;
+      continue;
+    }
+    if (released) {
+      bool exitReleased = scanCode == exitScanCode;
+      released = false;
+      if (exitReleased)
+        break;
+      continue;
+    }
+
+    if (scanCode == 0x75) {
+      if (DiskMenuMatchCount) {
+        selected = selected > 0 ? selected - 1 : DiskMenuMatchCount - 1;
+        ResetDiskMenuMarquee();
+        DrawDiskMenu(selected);
+      }
+    } else if (scanCode == 0x72) {
+      if (DiskMenuMatchCount) {
+        selected = selected + 1 < DiskMenuMatchCount ? selected + 1 : 0;
+        ResetDiskMenuMarquee();
+        DrawDiskMenu(selected);
+      }
+    } else if (scanCode == 0x5A && DiskMenuMatchCount > 0) {
+      // Consume Enter's break sequence too, so it is not delivered as an
+      // Apple II key after the selector closes.
+      FlashSelectedDiskRow(selected);
+      exitScanCode = scanCode;
+    } else if (scanCode == 0x76) {
+      if (DiskMenuSearch[0]) {
+        DiskMenuSearch[0] = '\0';
+        selected = 0;
+        RebuildDiskMenuMatches();
+        ResetDiskMenuMarquee();
+        DrawDiskMenu(selected);
+      } else {
+        selected = 0;
+        exitScanCode = scanCode;
+      }
+    } else if (scanCode == 0x66) {
+      size_t length = strlen(DiskMenuSearch);
+      if (length) {
+        DiskMenuSearch[length - 1] = '\0';
+        selected = 0;
+        RebuildDiskMenuMatches();
+        ResetDiskMenuMarquee();
+        DrawDiskMenu(selected);
+      }
+    } else {
+      char character = DiskMenuScancodeToCharacter(scanCode);
+      size_t length = strlen(DiskMenuSearch);
+      if (character && length + 1 < sizeof(DiskMenuSearch)) {
+        DiskMenuSearch[length] = character;
+        DiskMenuSearch[length + 1] = '\0';
+        selected = 0;
+        RebuildDiskMenuMatches();
+        ResetDiskMenuMarquee();
+        DrawDiskMenu(selected);
+      }
     }
   }
 
-  keyboard->enableVirtualKeys(false, false);
-  return selected;
+  return DiskMenuMatchCount ? DiskMenuMatches[selected] : 0;
 }
 
 bool LoadBootDiskFromSD() {
-  bool psramReady = false;
   bool diskImageInPSRAM = false;
   DEBUG_PRINTLN("[MEM] Initializing onboard PSRAM for disk buffer...");
   if (esp_spiram_init() == ESP_OK) {
 #ifndef BOARD_HAS_PSRAM
     esp_spiram_init_cache();
 #endif
-    psramReady = true;
+    DiskPSRAMReady = true;
     DEBUG_PRINTLN("[MEM] PSRAM initialized");
   } else {
     DEBUG_PRINTLN("[MEM] PSRAM unavailable; will try internal RAM");
@@ -232,9 +794,12 @@ bool LoadBootDiskFromSD() {
     return false;
   }
 
+  // Bootable games must run their own startup/loader from drive 1. The runtime
+  // selector is for attaching their data or second disk to drive 2.
   int selected = SelectDiskImage();
-  DEBUG_PRINTF("[SD] Selected %s\n", DiskMenu[selected].path);
-  FILE * imageFile = fopen(DiskMenu[selected].path, "rb");
+
+  DEBUG_PRINTF("[SD] Selected %s\n", DiskEntryPath(selected));
+  FILE * imageFile = fopen(DiskEntryPath(selected), "rb");
   if (!imageFile) {
     snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot open selected disk");
     DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
@@ -254,7 +819,7 @@ bool LoadBootDiskFromSD() {
     return false;
   }
 
-  if (psramReady) {
+  if (DiskPSRAMReady) {
     // Olimex FabGL initializes PSRAM at runtime with the IDE PSRAM option
     // disabled, then uses its address directly instead of the heap allocator.
     DiskImage = (unsigned char *) SOC_EXTRAM_DATA_LOW;
@@ -274,9 +839,9 @@ bool LoadBootDiskFromSD() {
     return false;
   }
 
-  size_t bytesRead = fread(DiskImage, 1, DISK_IMAGE_SIZE, imageFile);
+  size_t bytesRead = ReadFileThroughInternalBuffer(imageFile, DiskImage,
+                                                   DISK_IMAGE_SIZE, "boot disk");
   fclose(imageFile);
-  fabgl::FileBrowser::unmountSDCard();
   if (bytesRead != DISK_IMAGE_SIZE) {
     snprintf(DiskLoadError, sizeof(DiskLoadError), "Short read: %u of %u bytes", (unsigned) bytesRead, (unsigned) DISK_IMAGE_SIZE);
     DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
@@ -286,34 +851,45 @@ bool LoadBootDiskFromSD() {
     return false;
   }
 
+  // A size check alone cannot prove that the expected image reached RAM.
+  // Print a compact fingerprint and a few useful filesystem locations so a
+  // failing image can be compared with the original file on a computer.
+  uint32_t fingerprint = 2166136261UL; // FNV-1a 32-bit
+  for (size_t index = 0; index < DISK_IMAGE_SIZE; index++) {
+    fingerprint ^= DiskImage[index];
+    fingerprint *= 16777619UL;
+  }
+  DEBUG_PRINTF("[SD] Image fingerprint FNV1a=%08lX\n", (unsigned long) fingerprint);
+  DEBUG_PRINT("[SD] Track 0 sector 0:");
+  for (int index = 0; index < 16; index++)
+    DEBUG_PRINTF(" %02X", DiskImage[index]);
+  DEBUG_PRINTLN();
+  const size_t dosVTOCOffset = 17UL * 4096UL;
+  DEBUG_PRINT("[SD] Track 17 physical sector 0:");
+  for (int index = 0; index < 16; index++)
+    DEBUG_PRINTF(" %02X", DiskImage[dosVTOCOffset + index]);
+  DEBUG_PRINTLN();
+
   DiskLoadError[0] = '\0';
-  snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskMenu[selected].name);
+  snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskEntryName(selected));
+  DriveDiskImage[0] = DiskImage;
+  DriveDiskImageHeapAllocated[0] = !diskImageInPSRAM;
   DEBUG_PRINTF("[SD] Loaded %s into PSRAM (%u bytes)\n", LoadedDiskName, (unsigned) DISK_IMAGE_SIZE);
   return true;
 }
-
-int FastMode = 1;
-/* 0:correctly emulate drive rotation speed, !0:faster, but
-   the drive performs one rotation in 130.5ms (instead of
-   200ms). Turn fast mode off so ProDOS formatting and some
-   copy-protection schemes can work. */
 
 /* applemu incorrectly uses 0x1a00 length tracks. A real
    Apple disk drive spinning at ~300RPM, or 1 rev every
    200ms and writing a byte every 32us has a capacity
    of 6250 bytes/track not 6656. Setting TrackBufLen to
    0x1a00 allows my disk emulation to read applemu disks,
-   but with FastMode off the drive 'spins' a little too
-   slow, and the extra bytes that are available on every
+   and the extra bytes that are available on every
    track can confuse formatting programs. The ProDOS FILER
-   is one of these.  You MUST set FastMode to 0 and
-   TrackBufLen to 6250 for FILER to format. */
+   is one of these. TrackBufLen must remain 6250 for correct
+   300 RPM timing and ProDOS FILER compatibility. */
 int TrackBufLen = 6250;
 
 int DiskSlot;
-
-#define O_RDONLY 0
-#define O_RDWR 1
 
 enum DiskTypes {
   UnknownType = 0,
@@ -335,11 +911,12 @@ struct DriveState {
   int TrkBufOld; /* Data in track buffer needs updating before I/O */
   int ShouldRecal;
   /* variables used during emulation */
-  int Track; /* 0-70 */
+  int Track; /* half-track position, 0-68 for a 35-track .dsk */
   int Phase; /* 0- 3 */
   int ReadWP; /* 0/1  */
   int Active; /* 0/1  */
   int Writing; /* 0/1  */
+  unsigned char *DiskBuffer; /* host-visible disk buffer for this drive */
 }
 DrvSt[2];
 /* I'll keep what Gregory-kun uses.  So I don't like using low-level file
@@ -386,37 +963,100 @@ int openDisk(const char * Path, int flags) {
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
+bool LoadDiskImageForDrive(int drive, const char * path) {
+  if (drive < 0 || drive > 1 || !path || !*path) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Invalid drive or image path");
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    return false;
+  }
+
+  FILE * imageFile = fopen(path, "rb");
+  if (!imageFile) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot open drive %d image", drive + 1);
+    DEBUG_PRINTF("[SD] ERROR: %s: %s\n", DiskLoadError, path);
+    return false;
+  }
+
+  fseek(imageFile, 0, SEEK_END);
+  long imageSize = ftell(imageFile);
+  rewind(imageFile);
+  if (imageSize != (long) DISK_IMAGE_SIZE) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Invalid image size: %ld", imageSize);
+    DEBUG_PRINTF("[SD] ERROR: %s (need %u)\n", DiskLoadError, (unsigned) DISK_IMAGE_SIZE);
+    fclose(imageFile);
+    return false;
+  }
+
+  unsigned char * payload = NULL;
+  bool payloadHeapAllocated = false;
+  if (DiskPSRAMReady) {
+    // The board initializes PSRAM manually, so it is not part of the Arduino
+    // heap. Reserve one non-overlapping image-sized region per drive.
+    payload = (unsigned char *) SOC_EXTRAM_DATA_LOW + drive * DISK_IMAGE_SIZE;
+    DEBUG_PRINTF("[MEM] Drive %d disk buffer assigned to PSRAM at %p\n", drive + 1, payload);
+  } else {
+    DEBUG_PRINTF("[MEM] Drive %d trying internal RAM: %u bytes free, largest block %u bytes\n",
+                 drive + 1, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    payload = (unsigned char *) malloc(DISK_IMAGE_SIZE);
+    payloadHeapAllocated = payload != NULL;
+  }
+  if (!payload) {
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot allocate drive %d disk buffer", drive + 1);
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    fclose(imageFile);
+    return false;
+  }
+
+  size_t bytesRead = ReadFileThroughInternalBuffer(imageFile, payload,
+                                                   DISK_IMAGE_SIZE, "swapped disk");
+  fclose(imageFile);
+
+  if (bytesRead != DISK_IMAGE_SIZE) {
+    if (payloadHeapAllocated)
+      free(payload);
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Drive %d short read: %u of %u",
+             drive + 1, (unsigned) bytesRead, (unsigned) DISK_IMAGE_SIZE);
+    DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
+    return false;
+  }
+
+  if (DriveDiskImage[drive] && DriveDiskImageHeapAllocated[drive]) {
+    free(DriveDiskImage[drive]);
+  }
+
+  DriveDiskImage[drive] = payload;
+  DriveDiskImageHeapAllocated[drive] = payloadHeapAllocated;
+  DrvSt[drive].DiskBuffer = payload;
+  DrvSt[drive].DiskSize = DISK_IMAGE_SIZE;
+  DrvSt[drive].WritePro = 1;
+  if (DrvSt[drive].Track > MAX_DISK_HALF_TRACK)
+    DrvSt[drive].Track = MAX_DISK_HALF_TRACK;
+  // Force the emulated drive to rebuild its nibblized track from the new
+  // image.  This matters when the swapped drive was already selected: the
+  // controller's shared TrackBuffer may still contain bytes from the old disk.
+  DrvSt[drive].TrkBufOld = 1;
+  DrvSt[drive].TrkBufChanged = 0;
+  DrvSt[drive].ShouldRecal = 1;
+  DiskLoadError[0] = '\0';
+  return true;
+}
+
 void readSector(int drvAtivo, void * buf, size_t size) {
-  if (DiskImage && SeekPos <= DISK_IMAGE_SIZE && size <= DISK_IMAGE_SIZE - SeekPos) {
-    memcpy(buf, DiskImage + SeekPos, size);
+  unsigned char *driveBuffer = NULL;
+  if (drvAtivo >= 0 && drvAtivo < 2) {
+    driveBuffer = DrvSt[drvAtivo].DiskBuffer;
+  } else {
+    // Retain the legacy fallback only for callers that do not identify a
+    // drive.  An empty D2 must not silently expose D1's image.
+    driveBuffer = DiskImage;
+  }
+
+  if (driveBuffer && SeekPos <= DISK_IMAGE_SIZE && size <= DISK_IMAGE_SIZE - SeekPos) {
+    memcpy(buf, driveBuffer + SeekPos, size);
   } else {
     memset(buf, 0, size);
     DEBUG_PRINTF("[DISK] ERROR: invalid read at %u (%u bytes)\n", SeekPos, (unsigned) size);
   }
-
-#ifdef RESCUE_RAIDERS
-    memcpy(buf, Rescue_Raiders + SeekPos, size);
-#endif
-
-#ifdef GALAXIAN
-    memcpy(buf, Galaxian_1980 + SeekPos, size);
-#endif
-
-#ifdef CHOPLIFTER
-    memcpy(buf, Choplifter_19xx + SeekPos, size);
-#endif
-
-#ifdef CANNONBALL_BLITZ
-    memcpy(buf, Cannon_Ball_Blitz_19xx + SeekPos, size);
-#endif
-
-#ifdef CASTLE_WOLFENSTEIN
-    memcpy(buf, Castle_Wolfenstein_1981 + SeekPos, size);
-#endif
-
-#ifdef LOADRUNNER
-    memcpy(buf, Lode_Runner_1983 + SeekPos, size);
-#endif
 
 }
 
@@ -424,43 +1064,7 @@ void readSector(int drvAtivo, void * buf, size_t size) {
 
 /***************************************************************************************************************************************/
 void writeSector(int drvAtivo, void * buf, size_t size) {
-  // Milestone 1: the SD-backed image is deliberately read-only.
-
-#ifdef RESCUE_RAIDERS
-  //memcpy (Rescue_Raiders+SeekPos, buf, size);
-#endif
-
-#ifdef GALAXIAN
-  //memcpy (Galaxian_1980+SeekPos, buf, size);
-#endif
-
-#ifdef CHOPLIFTER
-  //memcpy (Choplifter_19xx+SeekPos, buf, size);
-#endif
-
-#ifdef CANNONBALL_BLITZ
-  //memcpy (Cannon_Ball_Blitz_19xx+SeekPos, buf, size);
-#endif
-
-#ifdef CASTLE_WOLFENSTEIN
-  //memcpy (Castle_Wolfenstein_1981+SeekPos, buf, size);
-#endif
-
-#ifdef LOADRUNNER
-  //memcpy (Lode_Runner_1983+SeekPos, buf, size);
-#endif
-}
-
-/***************************************************************************************************************************************/
-
-/***************************************************************************************************************************************/
-void closeDisk(int fd) {}
-
-/***************************************************************************************************************************************/
-
-/***************************************************************************************************************************************/
-long tell(int handle) {
-  return lseekDisk(handle, 0, SEEK_END);
+  // SD-backed images are deliberately read-only.
 }
 
 /***************************************************************************************************************************************/
@@ -569,6 +1173,13 @@ void GotoHardSector(struct DriveState * ds, int sector) {
   if (ds -> DiskType == XgsType) /* currently only PO 2MG supported */ {
     lseekDisk(ds -> DiskFH, 256L * (long) ProDOSSkew[sector] + 64, SEEK_CUR);
   }
+  if (DiskReadTraceCount < 24) {
+    DEBUG_PRINTF("[DISK] sector read #%u time=%lums drive=%d track=%d logical=%d offset=%u type=%d\n",
+                 DiskReadTraceCount + 1, millis(),
+                 CurDrv + 1, ds -> Track >> 1,
+                 sector, SeekPos, (int) ds -> DiskType);
+    DiskReadTraceCount++;
+  }
 }
 
 /***************************************************************************************************************************************/
@@ -578,7 +1189,7 @@ void GotoHardSector(struct DriveState * ds, int sector) {
 /* only for .DO type files */
 void ReadHardSector(struct DriveState * ds, int sector, unsigned char * buf) {
   GotoHardSector(ds, sector);
-  readSector(ds->Active, buf, 256);
+  readSector((int) (ds - DrvSt), buf, 256);
 }
 
 /***************************************************************************************************************************************/
@@ -588,7 +1199,7 @@ void ReadHardSector(struct DriveState * ds, int sector, unsigned char * buf) {
 /* only for .DO type files */
 void WriteHardSector(struct DriveState * ds, int sector, char * buf) {
   GotoHardSector(ds, sector);
-  writeSector(ds->Active, buf, 256);
+  writeSector((int) (ds - DrvSt), buf, 256);
 }
 
 /***************************************************************************************************************************************/
@@ -598,14 +1209,17 @@ void WriteHardSector(struct DriveState * ds, int sector, char * buf) {
 void NibbliseSector(unsigned char * data, unsigned char ** trackbufptr,
   int volume, int track, int sector) {
   /* Define a template for all disk sectors */
-	static unsigned char disktemplate[ 28 ] =
+	static unsigned char disktemplate[ 40 ] =
     {
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, /*  0- 5 = self-sync bytes */
-        0xd5, 0xaa, 0x96,                   /*  6- 8 = address header */
-        0, 0, 0, 0, 0, 0, 0, 0,             /*  9-16 = address */
-        0xde, 0xaa, 0xeb,                   /* 17-19 = address trailer */
-        0xff, 0xff, 0xff, 0xff, 0xff,       /* 20-24 = self-sync bytes */
-        0xd5, 0xaa, 0xad                    /* 25-27 = data header */
+        // Gap 3 / Gap 1 between sectors. A realistic gap distribution is
+        // important to loaders that use rotational sector timing.
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, /*  0-15 */
+        0xd5, 0xaa, 0x96,                                  /* 16-18 address prologue */
+        0, 0, 0, 0, 0, 0, 0, 0,                            /* 19-26 address */
+        0xde, 0xaa, 0xeb,                                  /* 27-29 address epilogue */
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,          /* 30-36 Gap 2 */
+        0xd5, 0xaa, 0xad                                   /* 37-39 data prologue */
     };
 
   int diskbyte, checksum, v;
@@ -615,17 +1229,17 @@ void NibbliseSector(unsigned char * data, unsigned char ** trackbufptr,
 
   /* fill in address in template */
   checksum = volume ^ track ^ sector;
-  disktemplate[9] = (volume >> 1) | 0xaa;
-  disktemplate[10] = volume | 0xaa;
-  disktemplate[11] = (track >> 1) | 0xaa;
-  disktemplate[12] = track | 0xaa;
-  disktemplate[13] = (sector >> 1) | 0xaa;
-  disktemplate[14] = sector | 0xaa;
-  disktemplate[15] = (checksum >> 1) | 0xaa;
-  disktemplate[16] = checksum | 0xaa;
+  disktemplate[19] = (volume >> 1) | 0xaa;
+  disktemplate[20] = volume | 0xaa;
+  disktemplate[21] = (track >> 1) | 0xaa;
+  disktemplate[22] = track | 0xaa;
+  disktemplate[23] = (sector >> 1) | 0xaa;
+  disktemplate[24] = sector | 0xaa;
+  disktemplate[25] = (checksum >> 1) | 0xaa;
+  disktemplate[26] = checksum | 0xaa;
 
   /* template */
-  for (diskbyte = 0; diskbyte < 28; diskbyte++) {
+  for (diskbyte = 0; diskbyte < 40; diskbyte++) {
     * trackbuf++ = disktemplate[diskbyte];
   }
   /* data */
@@ -680,6 +1294,15 @@ void NibbliseTrack(struct DriveState * ds) {
 /***************************************************************************************************************************************/
 void ReadTrack(struct DriveState * ds) {
   int idx;
+  unsigned long trackBuildStartedAt = micros();
+  bool traceTrackBuild = DiskTrackTraceCount < 12;
+
+  if (traceTrackBuild) {
+    DEBUG_PRINTF("[DISK] building track #%u time=%lums drive=%d track=%d type=%d\n",
+                 DiskTrackTraceCount + 1, millis(), CurDrv + 1, ds -> Track >> 1,
+                 (int) ds -> DiskType);
+    DiskTrackTraceCount++;
+  }
 
   /* Make sure that any unused part of the buffer has 0xff's in it */
   for (idx = 0; idx < 0x1a00; idx++) {
@@ -688,7 +1311,7 @@ void ReadTrack(struct DriveState * ds) {
   if (ds -> DiskType == RawType) {
     /* Disk ][ track/byte format (0x1a00 bytes/track) - just read the bytes */
     lseekDisk(ds -> DiskFH, (long)(ds -> Track >> 1) * 0x1a00L, SEEK_SET);
-    readSector(ds->Active, TrackBuffer, 0x1a00);
+    readSector((int) (ds - DrvSt), TrackBuffer, 0x1a00);
   }
   if (ds -> DiskType == DOSType || ds -> DiskType == ProDOSType ||
     ds -> DiskType == SimsysType || ds -> DiskType == XgsType) {
@@ -699,6 +1322,10 @@ void ReadTrack(struct DriveState * ds) {
   ds -> TrkBufChanged = 0;
   ds -> TrkBufOld = 0;
   ds -> ShouldRecal = 0;
+  if (traceTrackBuild) {
+    DEBUG_PRINTF("[DISK] track ready drive=%d track=%d build=%luus\n",
+                 CurDrv + 1, ds -> Track >> 1, micros() - trackBuildStartedAt);
+  }
 }
 
 /***************************************************************************************************************************************/
@@ -747,7 +1374,6 @@ void DeNibbliseData(int idx, char * SectorBuffer) {
 /***************************************************************************************************************************************/
 /* De-Nibblise Track: Convert from raw Disk ][ disk byte stream into DOS 3.3
    compatible track/sector-level data */
-#pragma argsused
 void DeNibbliseTrack(struct DriveState * ds) {
   unsigned int idx; /* index into track buffer */
   unsigned int start; /* index to start of track data */
@@ -837,7 +1463,7 @@ void WriteTrack(struct DriveState * ds) {
   if (ds -> DiskType == RawType) {
     /* Disk ][ track/byte format (0x1a00 bytes/track) - just write the bytes */
     lseekDisk(ds -> DiskFH, (long)(ds -> Track >> 1) * 0x1a00L, SEEK_SET);
-    writeSector(ds->Active, TrackBuffer, 0x1a00);
+    writeSector((int) (ds - DrvSt), TrackBuffer, 0x1a00);
   }
   if (ds -> DiskType == DOSType || ds -> DiskType == ProDOSType ||
     ds -> DiskType == SimsysType || ds -> DiskType == XgsType) {
@@ -853,16 +1479,10 @@ void WriteTrack(struct DriveState * ds) {
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
-void UpdateDiskStatus(void) {
-  //extern int dlight1, dlight2;
-  //dlight1=(DrvSt[0].Active); dlight2=(DrvSt[1].Active);
-  //virtplot(634,4,dlight1?COL_DRV_ON:COL_DRV_OFF);
-  //virtplot(636,4,dlight2?COL_DRV_ON:COL_DRV_OFF);
-  //virtcopy = 1;
-}
-
-long LastIO = 0;
-long Diff, LeftOverCycles;
+unsigned long LastIO = 0;
+unsigned long Diff, LeftOverCycles;
+static unsigned long LastRotationCycle = 0;
+static unsigned long RotationCycleRemainder = 0;
 
 /***************************************************************************************************************************************/
 
@@ -871,30 +1491,29 @@ byte ReadDiskIO(word Address) {
   struct DriveState * ds;
   int newtrack;
   int writezero;
-  char t[20];
 
   ds = & DrvSt[CurDrv];
   newtrack = ds -> Track;
 
   /* Update track buffer */
-  if ( /*ds->Active &&*/ ds -> Track % 2 == 0 && !FastMode) {
+  if (ds -> Active && ds -> Track % 2 == 0) {
     /* Only update when the disk drive is active AND the track is valid
        AND we're emulating correct disk drive speed */
-    Diff = cycle - LastIO;
-    if (Diff == 31L) {
-      Diff = 32L; /* handle faster 65C02 execution */
-    }
-    LeftOverCycles = Diff;
+    unsigned long rotationElapsed = cycle - LastRotationCycle;
+    LastRotationCycle = cycle;
+    RotationCycleRemainder += rotationElapsed;
     writezero = 0;
-    while (LeftOverCycles >= 32L) {
+    while (RotationCycleRemainder >= 32L) {
       if (ds -> Writing && writezero) {
         RangeCheckTBI( & TrkBufIdx);
         TrackBuffer[TrkBufIdx] = 0;
       }
       TrkBufIdx++;
-      LeftOverCycles -= 32L;
+      RotationCycleRemainder -= 32L;
       writezero = 1; /* delays >32us cause 0's to be written */
     }
+    Diff = cycle - LastIO;
+    LeftOverCycles = Diff & 31UL;
   }
 
   /* Handle I/O access */
@@ -959,9 +1578,17 @@ byte ReadDiskIO(word Address) {
   case 0x08:
     /* Q4 - Drive off */
     ds -> Active = 0;
+    LastRotationCycle = cycle;
+    LastIO = cycle;
+    RotationCycleRemainder = 0;
     break;
   case 0x09:
     /* Q4 - Drive on */
+    if (!ds -> Active) {
+      LastRotationCycle = cycle;
+      LastIO = cycle;
+      RotationCycleRemainder = 0;
+    }
     ds -> Active = 1;
     break;
   case 0x0a:
@@ -1056,21 +1683,15 @@ byte ReadDiskIO(word Address) {
     if (ds -> Writing) {
       if (!ds -> WritePro && WriteAccess && ds -> Track % 2 == 0) {
         /* write disk byte */
-        if (FastMode) {
-          RangeCheckTBI( & TrkBufIdx);
-          TrackBuffer[TrkBufIdx++] = DataLatch;
-          ds -> TrkBufChanged = 1;
-        } else {
-          if (Diff >= 32L) {
-            if (Diff <= 40L) {
-              LeftOverCycles = 0L;
-            }
-            LastIO = cycle - LeftOverCycles;
+        if (Diff >= 32L) {
+          if (Diff <= 40L) {
+            LeftOverCycles = 0L;
           }
-          RangeCheckTBI( & TrkBufIdx);
-          TrackBuffer[TrkBufIdx] = DataLatch;
-          ds -> TrkBufChanged = 1;
+          LastIO = cycle - LeftOverCycles;
         }
+        RangeCheckTBI( & TrkBufIdx);
+        TrackBuffer[TrkBufIdx] = DataLatch;
+        ds -> TrkBufChanged = 1;
       }
     } else {
       /* read */
@@ -1079,17 +1700,12 @@ byte ReadDiskIO(word Address) {
         DataLatch = ds -> WritePro ? 0xff : 0x00;
       } else {
         /* read disk byte */
-        if (FastMode) {
+        if (Diff >= 32L) {
           RangeCheckTBI( & TrkBufIdx);
-          DataLatch = TrackBuffer[TrkBufIdx++];
+          DataLatch = TrackBuffer[TrkBufIdx];
+          LastIO = cycle - LeftOverCycles;
         } else {
-          if (Diff >= 32L) {
-            RangeCheckTBI( & TrkBufIdx);
-            DataLatch = TrackBuffer[TrkBufIdx];
-            LastIO = cycle - LeftOverCycles;
-          } else {
-            DataLatch = 0;
-          }
+          DataLatch = 0;
         }
       }
     }
@@ -1103,10 +1719,28 @@ byte ReadDiskIO(word Address) {
       newtrack = 0;
       ds -> ShouldRecal = 1;
     }
-    if (newtrack > 70) {
-      newtrack = 70;
+    if (newtrack > MAX_DISK_HALF_TRACK) {
+      newtrack = MAX_DISK_HALF_TRACK;
       ds -> ShouldRecal = 1;
     }
+
+    // The boot ROM deliberately bangs the head against the track-zero stop
+    // while recalibrating. Once clamped, this is not a real track change and
+    // must not invalidate/rebuild the current track or reset I/O telemetry.
+    if (ds -> Track == newtrack) {
+      return DataLatch;
+    }
+
+#if ENABLE_DISK_DIAGNOSTICS
+    if (DiskIOTraceCount < 32) {
+      unsigned long now = millis();
+      DEBUG_PRINTF("[DISKIO] head %d->%d elapsed=%lums idx=%u motor=%d\n",
+                   ds -> Track, newtrack, now - DiskHeadPositionChangedAt,
+                   TrkBufIdx, ds -> Active);
+      DiskIOTraceCount++;
+      DiskHeadPositionChangedAt = now;
+    }
+#endif
     /* NOTE: only even Disk ][ tracks are valid */
     if (ds -> TrkBufChanged && ds -> Track % 2 == 0) {
       WriteTrack(ds);
@@ -1114,8 +1748,6 @@ byte ReadDiskIO(word Address) {
     ds -> Track = newtrack;
     ds -> TrkBufOld = 1;
   }
-
-  UpdateDiskStatus();
 
   return DataLatch;
 }
@@ -1138,40 +1770,7 @@ void WriteDiskIO(word Address, byte Data) {
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
-void DiskReset(void) {
-  DrvSt[0].Active = 0;
-  DrvSt[0].ReadWP = 0;
-  DrvSt[0].Writing = 0;
-  DrvSt[1].Active = 0;
-  DrvSt[1].ReadWP = 0;
-  DrvSt[1].Writing = 0;
-  UpdateDiskStatus();
-}
-
-/***************************************************************************************************************************************/
-
-/***************************************************************************************************************************************/
-void UnmountDisk(int disk) {
-  struct DriveState * ds;
-  ds = & DrvSt[disk];
-  if (ds -> TrkBufChanged) {
-    WriteTrack(ds);
-  }
-  closeDisk(ds -> DiskFH);
-  if (ds -> DiskSize == 0L) {
-    /* nothing in the file - might as well delete it */
-    //remove ( ds->DiskFN );
-  }
-  ds -> DiskFH = 0;
-}
-
-/***************************************************************************************************************************************/
-
-/***************************************************************************************************************************************/
 void DiskAutoID(struct DriveState * ds) {
-  unsigned char t1, t2; /* temporary data during identification */
-  int idcount; /* count of ProDOS identifying characteristics */
-
   /* if the type is unknown, try to auto-identify */
   if (ds -> DiskType == UnknownType) {
     //      if ( ds->DiskSize % 0x1a00L == 0L )   /* Raw 0x1a00 bytes/track */
@@ -1210,6 +1809,8 @@ void MountDisk(int disk) {
     if (ds -> DiskSize < 143360) ds -> DiskSize = 143360; // uso. 2002.1109
   }
   DiskAutoID(ds);
+  DEBUG_PRINTF("[DISK] mounted drive=%d size=%ld type=%d writeProtected=%d\n",
+               disk + 1, ds -> DiskSize, (int) ds -> DiskType, ds -> WritePro);
   ds -> TrkBufChanged = 0;
   ds -> TrkBufOld = 1;
   ds -> ShouldRecal = 1;
@@ -1227,24 +1828,20 @@ void MountDisk(int disk) {
 void InitDisk(int slot) {
   DiskSlot = slot;
 
-  //strcpy( DrvSt[ 0 ].DiskFN, "disk6a.dsk" );
+  // drive 1 is the OS/boot image host slot
+  DrvSt[0].DiskBuffer = DriveDiskImage[0] ? DriveDiskImage[0] : DiskImage;
   DrvSt[0].DiskType = UnknownType;
   MountDisk(0);
-  //strcpy( DrvSt[ 1 ].DiskFN, "disk6b.dsk" );
-  DrvSt[ 1 ].DiskType = UnknownType;
-  MountDisk( 1 );
 
-  UpdateDiskStatus();
+  // drive 2 remains an attachable runtime slot for host-level image swaps
+  DrvSt[1].DiskBuffer = DriveDiskImage[1] ? DriveDiskImage[1] : NULL;
+  DrvSt[1].DiskType = UnknownType;
+  MountDisk(1);
 
   CurDrv = 0;
   DataLatch = 0;
   TrkBufIdx = 0;
-}
-
-/***************************************************************************************************************************************/
-
-/***************************************************************************************************************************************/
-void ShutdownDisk(void) {
-  UnmountDisk(0);
-  UnmountDisk(1);
+#if ENABLE_DISK_DIAGNOSTICS
+  DiskHeadPositionChangedAt = millis();
+#endif
 }

@@ -18,7 +18,9 @@
 
 *****************************************************************************/
 
-#ifdef DEBUG_PROG  //cool way to have debug serial ONLY when you want it, and replaced with effectively no statement when not needed. Supports basic formatting of vars.
+#include "build_config.h"
+
+#if ENABLE_SERIAL_DEBUG
   #define DEBUG_PRINTF(x,...) Serial.printf(x, ##__VA_ARGS__)
   #define DEBUG_PRINT(x,...) Serial.print(x, ##__VA_ARGS__)
   #define DEBUG_PRINTLN(x,...) Serial.println(x, ##__VA_ARGS__)
@@ -28,6 +30,30 @@
   #define DEBUG_PRINTLN(x,...)
 #endif
 
+// CPU runtime symbols used from the main sketch task loop and emitted by cpu.ino.
+extern unsigned short PC;
+extern unsigned char STP, A, X, Y, SR;
+extern unsigned char opcode, opflags;
+extern unsigned short argument_addr;
+extern const unsigned char scancode_to_apple[];
+extern unsigned long cycle;
+extern uint64_t TotalCycles;
+extern uint64_t EmulationTimingBaseCycles;
+extern uint64_t EmulationTimingBaseMicros;
+extern bool EmulationTimingReady;
+void PaceSpeakerToEmulatedCycle();
+
+// CPU entry points required by the runtime task.
+void initCode();
+void execCode();
+void ResetMemorySoftSwitches();
+
+// Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();
+void FindDiskImages();
+int SelectDiskImage();
+bool LoadDiskImageForDrive(int drive, const char * path);
+void DrawVGAAlignmentMarkers();
+
 extern char DiskLoadError[96];
 extern char LoadedDiskName[64];

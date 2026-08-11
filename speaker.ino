@@ -33,6 +33,10 @@ void speaker_begin() {
 /***************************************************************************************************************************************/
 void speaker_toggle() {
   static boolean state = false;
+  // CPU execution is normally paced in batches for efficiency. Audio cannot
+  // be emitted in those bursts: each edge determines the perceived pitch, so
+  // wait until the wall-clock instant represented by this 6502 cycle.
+  PaceSpeakerToEmulatedCycle();
   state = (state)?false:true;
   digitalWrite(SPEAKER_PIN, state);
 }

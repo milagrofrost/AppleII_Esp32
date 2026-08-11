@@ -74,7 +74,7 @@ Arduino/libraries/Timer-master/
 └── Event.cpp
 ```
 
-`Preferences`, SPI, Wi-Fi support used by FabGL, PSRAM support, FAT filesystem support, and the standard C file/directory APIs are supplied by ESP32 Arduino core 2.0.11. No separate libraries are required for them.
+SPI, Wi-Fi support used by FabGL, PSRAM support, FAT filesystem support, and the standard C file/directory APIs are supplied by ESP32 Arduino core 2.0.11. No separate libraries are required for them.
 
 ### 5. Configure the board
 
@@ -100,7 +100,7 @@ Open the root `EspAppleII.ino`, click **Verify**, and then click **Upload**. Aft
 If Arduino reports a missing header:
 
 - `Timer.h`: install the Jack Christensen Timer library.
-- `fabgl.h` or `fabui.h`: install the Olimex FabGL fork and remove competing FabGL copies.
+- `fabgl.h`: install the Olimex FabGL fork and remove competing FabGL copies.
 - ESP32-specific headers: verify that ESP32 Arduino core **2.0.11** and **ESP32 Dev Module** are selected.
 
 ## SD-card disk images
@@ -120,7 +120,7 @@ SD card root/
         └── another-game.dsk
 ```
 
-`/apple2/dos33.dsk` is the default and backward-compatible boot image. Additional images belong in `/apple2/disks/`.
+`/apple2/dos33.dsk` is the default and backward-compatible boot image. Additional images belong in `/apple2/disks/`, which may contain subdirectories.
 
 For the current milestone, every image must be:
 
@@ -130,19 +130,42 @@ For the current milestone, every image must be:
 
 Images with other sizes are skipped and reported over serial. Formats such as `.po`, `.nib`, `.woz`, and 2MG are not currently supported.
 
-The repository includes a PowerShell extraction utility that recreates `dos33.dsk` from the original embedded array:
+For a large archive, generate the index on the computer before copying the archive to the SD card:
 
-```powershell
-./extract_dos33.ps1
+```bash
+python3 tools/build_disk_index.py "/path/to/apple2/disks"
 ```
 
-It creates:
+This creates `apple2-index.txt` inside that directory. Copy the complete `apple2` tree to the SD card. The firmware loads this index directly; if it is absent or invalid, it falls back to recursively scanning the directory.
+
+The firmware stores compact catalog records and a shared path-string pool in PSRAM. Up to 4,096 indexed images are supported.
+
+## Debug and release builds
+
+Normal Arduino IDE builds use the debug profile. It enables serial diagnostics, limited CPU and Disk II traces, and stack high-water reporting every ten seconds.
+
+For a quiet release build, define this compiler symbol:
 
 ```text
-sdcard/apple2/dos33.dsk
+ESPAPPLEII_RELEASE=1
 ```
 
-Copy the generated `apple2` directory to the root of the SD card.
+With `arduino-cli`, add:
+
+```bash
+--build-property compiler.cpp.extra_flags=-DESPAPPLEII_RELEASE=1
+```
+
+Release mode removes diagnostic code from hot paths. It does not alter CPU pacing, Disk II rotation timing, video behavior, or disk-index capacity.
+
+Debug builds report lines such as:
+
+```text
+[TASK] CPU minimum free stack=...
+[TASK] Video minimum free stack=...
+```
+
+These are the lowest remaining stack-space values observed since each task started. Both tasks currently reserve 8,192 bytes; test several games and disk-menu operations before reducing them further.
 
 ## Startup disk selector
 
@@ -152,7 +175,9 @@ When more than one valid image is available, a VGA disk-selection screen appears
 - **Enter:** load and boot the selected disk
 - **Escape:** select the first entry, normally `dos33.dsk`
 
-The selector supports up to 32 valid images and displays 18 entries at a time. It runs before the emulator tasks start, then restores the existing raw PS/2 keyboard handling used by the Apple II emulator.
+With PSRAM, the selector supports up to 4,096 images. Without PSRAM it retains a 32-image fallback catalog. The number of visible rows is calculated from the active VGA canvas height. Type a partial name for substring search; looser fuzzy subsequence matches are shown afterward. Long selected names scroll horizontally.
+
+Press **Ctrl+Alt+Delete** while emulation is running to reopen the disk selector and cold-boot the newly selected drive-1 image.
 
 If only `/apple2/dos33.dsk` is present, it boots immediately without showing the selector.
 
@@ -179,11 +204,11 @@ Errors are reported for SD initialization, missing images, incorrect image sizes
 The project currently:
 
 - Emulates the original Apple II, not later Apple II models
-- Uses drive 1 only
-- Loads one disk at startup; runtime disk swapping is not implemented
+- Emulates two Disk II drives with independently loaded memory-backed images
+- Supports cold-boot disk changes from the runtime disk selector
 - Treats disk images as read-only, so saved games and disk writes do not persist
-- Implements page 1 for text, low-resolution, and high-resolution graphics
-- Contains compatibility workarounds for software that expects page 2
+- Implements page 1 and page 2 for text, low-resolution, and high-resolution graphics
+- Implements mixed graphics/text display mode
 - Uses a PS/2 keyboard; joystick emulation is not implemented
 - Preserves the existing 6502, video, keyboard, sound, and Disk II behavior
 
