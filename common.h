@@ -19,6 +19,7 @@
 *****************************************************************************/
 
 #include "build_config.h"
+#include "machine.h"
 
 #if ENABLE_SERIAL_DEBUG
   #define DEBUG_PRINTF(x,...) Serial.printf(x, ##__VA_ARGS__)
@@ -47,6 +48,10 @@ void PaceSpeakerToEmulatedCycle();
 void initCode();
 void execCode();
 void ResetMemorySoftSwitches();
+void InvalidateVideoCaches();
+extern bool iie80Column;
+extern bool iieAltCharset;
+extern bool iieDoubleHires;
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();

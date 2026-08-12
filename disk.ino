@@ -177,7 +177,8 @@ static void PrepareDiskMenuStorage() {
   size_t physicalPSRAMSize = esp_spiram_get_size();
   size_t psramSize = physicalPSRAMSize < SOC_EXTRAM_DATA_SIZE
                    ? physicalPSRAMSize : SOC_EXTRAM_DATA_SIZE;
-  size_t reservedForDrives = 2 * DISK_IMAGE_SIZE;
+  // Two disk buffers plus IIe auxiliary main and language-card storage.
+  size_t reservedForDrives = 2 * DISK_IMAGE_SIZE + 0x18000UL;
   if (psramSize <= reservedForDrives)
     return;
 
@@ -631,7 +632,7 @@ static void DrawDiskMenu(int selected) {
   canvas.setPenColor(Color::BrightYellow);
   canvas.drawText(20, 15, "APPLE II DISK SELECTOR");
   canvas.setPenColor(Color::White);
-  canvas.drawText(20, 30, "TYPE TO SEARCH  UP/DOWN  ENTER");
+  canvas.drawText(20, 30, "SEARCH  UP/DOWN  ENTER  TAB=MACHINE");
 
   canvas.setPenColor(Color::BrightCyan);
   char searchLine[48];
@@ -663,18 +664,17 @@ static void DrawDiskMenu(int selected) {
 
   canvas.setBrushColor(Color::Black);
   canvas.setPenColor(Color::BrightCyan);
-  char status[48];
+  char status[64];
   if (DiskMenuMatchCount)
     snprintf(status, sizeof(status), "MATCH %d OF %d   TOTAL %d", selected + 1, DiskMenuMatchCount, DiskMenuCount);
   else
     snprintf(status, sizeof(status), "NO MATCHES   TOTAL %d", DiskMenuCount);
   canvas.drawText(20, canvas.getHeight() - 14, status);
+  canvas.setPenColor(IsIIeMode() ? Color::BrightGreen : Color::BrightYellow);
+  canvas.drawText(canvas.getWidth() - 150, 15, MachineProfileName());
 }
 
 int SelectDiskImage() {
-  if (DiskMenuCount == 1)
-    return 0;
-
   auto keyboard = PS2Controller.keyboard();
   int selected = 0;
   bool released = false;
@@ -712,7 +712,15 @@ int SelectDiskImage() {
       continue;
     }
 
-    if (scanCode == 0x75) {
+    if (scanCode == 0x0D) {
+      AppleMachineProfile next = IsIIeMode() ? APPLE_II_PLUS_64K : APPLE_IIE_128K;
+      if (!SetMachineProfile(next)) {
+        canvas.setPenColor(Color::BrightRed);
+        canvas.drawText(20, canvas.getHeight() - 28, "ADD 16K IIE ROM TO /apple2/roms");
+        delay(900);
+      }
+      DrawDiskMenu(selected);
+    } else if (scanCode == 0x75) {
       if (DiskMenuMatchCount) {
         selected = selected > 0 ? selected - 1 : DiskMenuMatchCount - 1;
         ResetDiskMenuMarquee();
@@ -787,6 +795,7 @@ bool LoadBootDiskFromSD() {
   }
 
   FindDiskImages();
+  InitializeMachineProfiles();
   if (DiskMenuCount == 0) {
     snprintf(DiskLoadError, sizeof(DiskLoadError), "No valid .dsk images found");
     DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);

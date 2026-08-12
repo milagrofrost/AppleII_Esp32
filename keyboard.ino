@@ -93,6 +93,10 @@ static void HostDiskManagerTrigger() {
     // and the CPU task is suspended.
     memset(RAM, 0, sizeof(RAM));
     memset(RAMEXT, 0, sizeof(RAMEXT));
+    if (AUXRAM)
+      memset(AUXRAM, 0, 0x10000);
+    if (AUXRAMEXT)
+      memset(AUXRAMEXT, 0, 0x4000);
     memset(RAM_TXT_BACK, 0xFF, sizeof(RAM_TXT_BACK));
     memset(RAM_HGR_BACK, 0xFF, sizeof(RAM_HGR_BACK));
     ResetMemorySoftSwitches();

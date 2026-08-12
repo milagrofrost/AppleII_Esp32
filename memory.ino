@@ -18,6 +18,8 @@
 
 *****************************************************************************/
 
+#include "video.h"
+
 const unsigned char DISK_ROM[] PROGMEM = { //$C600 - C6FFF
         0xa2, 0x20, 0xa0, 0x00, 0xa2, 0x03, 0x86, 0x3c, 0x8a, 0x0a, 0x24, 0x3c, 0xf0, 0x10, 0x05, 0x3c, 
         0x49, 0xff, 0x29, 0x7e, 0xb0, 0x08, 0x4a, 0xd0, 0xfb, 0x98, 0x9d, 0x56, 0x03, 0xc8, 0xe8, 0x10, 
@@ -812,6 +814,33 @@ unsigned char memlcramr;                /* read LC RAM or ROM?                  
 unsigned char memlcramw;                /* write LC RAM or ROM?                                 */
 unsigned char memlcbank2;               /* read from LC bank 1 or LC bank 2                     */
 static bool memlcprewrite;               /* first odd-switch access arms LC writes               */
+static bool iie80Store;
+static bool iieRamReadAux;
+static bool iieRamWriteAux;
+static bool iieIntCxROM;
+static bool iieAltZeroPage;
+static bool iieSlotC3ROM;
+static bool iieInternalC8ROM;
+bool iie80Column;
+bool iieAltCharset;
+bool iieDoubleHires;
+
+bool IIe80StoreEnabled() {
+  return IsIIeMode() && iie80Store;
+}
+
+void ResetIIeSoftSwitches() {
+  iie80Store = false;
+  iieRamReadAux = false;
+  iieRamWriteAux = false;
+  iieIntCxROM = false;
+  iieAltZeroPage = false;
+  iieSlotC3ROM = false;
+  iieInternalC8ROM = false;
+  iie80Column = false;
+  iieAltCharset = false;
+  iieDoubleHires = false;
+}
 
 void ResetMemorySoftSwitches() {
   // Power-on state: motherboard ROM visible and language-card writes locked.
@@ -820,6 +849,7 @@ void ResetMemorySoftSwitches() {
   memlcramw = 0;
   memlcbank2 = 0;
   memlcprewrite = false;
+  ResetIIeSoftSwitches();
 }
 int k=0;
 
@@ -831,11 +861,51 @@ static unsigned int LanguageCardIndex(unsigned short address) {
   return 0x2000 + (address - 0xE000);
 }
 
+static bool IIeUseAuxiliaryRAM(unsigned short address, bool writing) {
+  if (!IsIIeMode() || !AUXRAM)
+    return false;
+  if (address < 0x0200)
+    return iieAltZeroPage;
+  bool auxiliary = writing ? iieRamWriteAux : iieRamReadAux;
+  if (iie80Store && address >= 0x0400 && address < 0x0800)
+    auxiliary = (gm & PG2) != 0;
+  if (iie80Store && (gm & HRG) && address >= 0x2000 && address < 0x4000)
+    auxiliary = (gm & PG2) != 0;
+  return auxiliary;
+}
+
+static unsigned char IIeStatus(bool enabled) {
+  return (enabled ? 0x80 : 0x00) | (k & 0x7f);
+}
+
+static void SetIIeSwitch(unsigned short address) {
+  if (!IsIIeMode())
+    return;
+  switch (address) {
+    case 0xC000: iie80Store = false; break;
+    case 0xC001: iie80Store = true; break;
+    case 0xC002: iieRamReadAux = false; break;
+    case 0xC003: iieRamReadAux = true; break;
+    case 0xC004: iieRamWriteAux = false; break;
+    case 0xC005: iieRamWriteAux = true; break;
+    case 0xC006: iieIntCxROM = false; break;
+    case 0xC007: iieIntCxROM = true; break;
+    case 0xC008: iieAltZeroPage = false; break;
+    case 0xC009: iieAltZeroPage = true; break;
+    case 0xC00A: iieSlotC3ROM = false; break;
+    case 0xC00B: iieSlotC3ROM = true; break;
+    case 0xC00C: iie80Column = false; InvalidateVideoCaches(); break;
+    case 0xC00D: iie80Column = true; InvalidateVideoCaches(); break;
+    case 0xC00E: iieAltCharset = false; InvalidateVideoCaches(); break;
+    case 0xC00F: iieAltCharset = true; InvalidateVideoCaches(); break;
+  }
+}
+
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
 unsigned char readPgz8(unsigned short address) {
-    return RAM[address];
+    return IIeUseAuxiliaryRAM(address, false) ? AUXRAM[address] : RAM[address];
 }
 
 /***************************************************************************************************************************************/
@@ -844,21 +914,46 @@ unsigned char readPgz8(unsigned short address) {
 unsigned char read8(unsigned short address) {
   unsigned char page = address>>8;
   if(page < 0xC0) {
-    return RAM[address];
-	} else if (page == 0xC6) {
+    return IIeUseAuxiliaryRAM(address, false) ? AUXRAM[address] : RAM[address];
+	} else if (page == 0xC6 && (!IsIIeMode() || !iieIntCxROM)) {
 		return DISK_ROM[address - 0xC600];
   } else if (page >= 0xD0) {
-      if (!memlcramr) 
-        return ROM[address-0xD000];
-      else 
-        return RAMEXT[LanguageCardIndex(address)];
+      if (!memlcramr)
+        return IsIIeMode() ? IIE_ROM[address - 0xC000] : ROM[address-0xD000];
+      return (IsIIeMode() && iieAltZeroPage ? AUXRAMEXT : RAMEXT)[LanguageCardIndex(address)];
   } else {
+    if (IsIIeMode() && address >= 0xC100) {
+      bool internal = iieIntCxROM || (page == 0xC3 && !iieSlotC3ROM) ||
+                      (address >= 0xC800 && iieInternalC8ROM);
+      if (page == 0xC3 && !iieSlotC3ROM)
+        iieInternalC8ROM = true;
+      if (internal) {
+        unsigned char value = IIE_ROM[address - 0xC000];
+        if (address == 0xCFFF)
+          iieInternalC8ROM = false;
+        return value;
+      }
+      if (address == 0xCFFF)
+        iieInternalC8ROM = false;
+    }
     // Keyboard Data
     if(address == 0xC000) return keyboard_read(); else
     // Keyboard Strobe
     if(address == 0xC010) keyboard_strobe(); else
     if(address == 0xC011) return (memlcbank2  | (k&0x7f)); else
     if(address == 0xC012) return (memlcramr   | (k&0x7f)); else
+    if(address == 0xC013 && IsIIeMode()) return IIeStatus(iieRamReadAux); else
+    if(address == 0xC014 && IsIIeMode()) return IIeStatus(iieRamWriteAux); else
+    if(address == 0xC015 && IsIIeMode()) return IIeStatus(iieIntCxROM); else
+    if(address == 0xC016 && IsIIeMode()) return IIeStatus(iieAltZeroPage); else
+    if(address == 0xC017 && IsIIeMode()) return IIeStatus(iieSlotC3ROM); else
+    if(address == 0xC018 && IsIIeMode()) return IIeStatus(iie80Store); else
+    if(address == 0xC01A && IsIIeMode()) return IIeStatus(!(gm & GRX)); else
+    if(address == 0xC01B && IsIIeMode()) return IIeStatus(gm & SPL); else
+    if(address == 0xC01C && IsIIeMode()) return IIeStatus(gm & PG2); else
+    if(address == 0xC01D && IsIIeMode()) return IIeStatus(gm & HRG); else
+    if(address == 0xC01E && IsIIeMode()) return IIeStatus(iieAltCharset); else
+    if(address == 0xC01F && IsIIeMode()) return IIeStatus(iie80Column); else
     if(address == 0xC019) { 
     } 
     else
@@ -890,7 +985,8 @@ unsigned short read16(unsigned short address) {
 
 /***************************************************************************************************************************************/
 void writePgz8(unsigned short address, unsigned char value) {
-    RAM[address] = value;
+    if (IIeUseAuxiliaryRAM(address, true)) AUXRAM[address] = value;
+    else RAM[address] = value;
 }
 
 /***************************************************************************************************************************************/
@@ -900,15 +996,19 @@ void write8(unsigned short address, unsigned char value) {
   unsigned char page = address >> 8;
   if (page < 0xC0)
   {
-    RAM[address] = value;
+    if (IIeUseAuxiliaryRAM(address, true)) AUXRAM[address] = value;
+    else RAM[address] = value;
   }
   else if (page >= 0xD0)
   {
   	if (memlcramw)
-		RAMEXT[LanguageCardIndex(address)] = value;
+		(IsIIeMode() && iieAltZeroPage ? AUXRAMEXT : RAMEXT)[LanguageCardIndex(address)] = value;
   }
   else
   {
+	  if (address >= 0xC000 && address <= 0xC00F)
+	    SetIIeSwitch(address);
+	  else
   	// Keyboard Strobe
   	if (address == 0xC010) keyboard_strobe();
   	else

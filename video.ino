@@ -98,6 +98,12 @@ static unsigned char cachedFlashChar = 0;
 static unsigned short cachedLoresPage = 0;
 static bool loresCacheValid = false;
 
+void InvalidateVideoCaches() {
+  textCacheValid = false;
+  loresCacheValid = false;
+  hiresCacheValid = false;
+}
+
 // The Apple II lo-res values are composite-video colors. VGA16 cannot
 // reproduce every shade exactly, but this preserves their color families and
 // is far closer than treating every non-black value as white.
@@ -146,6 +152,30 @@ void virtline(unsigned int rastline)
 	{
 		case modetext40:
 			/*text 40 column */
+			if (IsIIeMode() && iie80Column) {
+				addr = textAddr[rastline] + virttextpage;
+				for (int column = 0; column < 80; column++) {
+					unsigned char character = (column & 1) ? RAM[addr] : AUXRAM[addr];
+					if (column & 1) addr++;
+					for (int line = 0; line < 8; line++) {
+						unsigned int glyph;
+						if (character >= 128)
+							glyph = AppleFont[(((character + (character - 128 < ' ' ? 64 : 0)) & 0x7f) << 3) | line];
+						else if (character >= 64)
+							glyph = AppleFont[((character - 0x40) << 3) | line] ^ (iieAltCharset ? 0x00 : flashChar);
+						else
+							glyph = AppleFont[((character + 0x40) << 3) | line] ^ 0xFF;
+						for (int pixel = 0; pixel < 7; pixel++) {
+							int x0 = (column * 7 + pixel) / 2;
+							int x1 = (column * 7 + pixel + 1) / 2;
+							if (x1 == x0) x1++;
+							Color color = (glyph & (0x80 >> pixel)) ? COL_HGR7 : COL_HGR0;
+							for (int x = x0; x < x1; x++) canvas.setPixel(x, rastline * 8 + line, color);
+						}
+					}
+				}
+				return;
+			}
 			if (cachedFlashChar != flashChar) {
 				cachedFlashChar = flashChar;
 				textCacheValid = false;
@@ -202,6 +232,20 @@ void virtline(unsigned int rastline)
 
 		case modelres40:
 			/*lores */
+			if (IsIIeMode() && iie80Column) {
+				addr = textAddr[rastline] + virttextpage;
+				for (int column = 0; column < 80; column++) {
+					unsigned char packed = (column & 1) ? RAM[addr] : AUXRAM[addr];
+					if (column & 1) addr++;
+					for (int line = 0; line < 8; line++) {
+						Color color = loresPalette[line < 4 ? packed & 0x0F : packed >> 4];
+						int x0 = column * 7 / 2;
+						int x1 = (column + 1) * 7 / 2;
+						for (int x = x0; x < x1; x++) canvas.setPixel(x, rastline * 8 + line, color);
+					}
+				}
+				return;
+			}
 			if (cachedLoresPage != virttextpage) {
 				cachedLoresPage = virttextpage;
 				loresCacheValid = false;
@@ -239,6 +283,30 @@ void virtline(unsigned int rastline)
 
 		case modehres:
 			/*hires */
+			if (IsIIeMode() && iie80Column && iieDoubleHires) {
+				for (int line = 0; line < 8; line++) {
+					addr = hresaddr[rastline] + hreslineaddr[line] + virthrespage;
+					int outputCell = 0;
+					unsigned int shift = 0;
+					int availableBits = 0;
+					for (int byteIndex = 0; byteIndex < 40; byteIndex++) {
+						unsigned char pair[2] = { AUXRAM[addr + byteIndex], RAM[addr + byteIndex] };
+						for (int bank = 0; bank < 2; bank++) {
+							shift |= (unsigned int) (pair[bank] & 0x7F) << availableBits;
+							availableBits += 7;
+							while (availableBits >= 4 && outputCell < 140) {
+								Color color = loresPalette[shift & 0x0F];
+								canvas.setPixel(outputCell * 2, rastline * 8 + line, color);
+								canvas.setPixel(outputCell * 2 + 1, rastline * 8 + line, color);
+								shift >>= 4;
+								availableBits -= 4;
+								outputCell++;
+							}
+						}
+					}
+				}
+				return;
+			}
 			if (cachedHiresPage != virthrespage) {
 				cachedHiresPage = virthrespage;
 				hiresCacheValid = false;
@@ -363,6 +431,20 @@ void CheckVideoIO(word Address) {
       }
       return;
     }
+    case 0xc05e : {
+      if (IsIIeMode()) {
+        iieDoubleHires = false;
+        InvalidateVideoCaches();
+      }
+      return;
+    }
+    case 0xc05f : {
+      if (IsIIeMode()) {
+        iieDoubleHires = true;
+        InvalidateVideoCaches();
+      }
+      return;
+    }
  }
 }
 
@@ -390,7 +472,9 @@ void virtsetmode() {
     virtmodedown = modetext40;
   }
 
-  if (!(gm & PG2)) {
+  // With 80STORE enabled, PAGE2 selects the main/aux bank for video memory;
+  // the displayed address remains the page-1 range.
+  if (!(gm & PG2) || IIe80StoreEnabled()) {
     /* set the visible page */
     virttextpage = 0x400;
     virthrespage = 0x2000;

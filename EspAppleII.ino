@@ -91,6 +91,8 @@ TaskHandle_t Task2;
 /* virtual screen buffer */
 unsigned char RAM[0xC000];
 unsigned char RAMEXT[0x4000];
+unsigned char * AUXRAM = NULL;
+unsigned char * AUXRAMEXT = NULL;
 unsigned char RAM_TXT_BACK[0x400];
 unsigned char RAM_HGR_BACK[0x2000];
 

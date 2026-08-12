@@ -130,6 +130,18 @@ For the current milestone, every image must be:
 
 Images with other sizes are skipped and reported over serial. Formats such as `.po`, `.nib`, `.woz`, and 2MG are not currently supported.
 
+## Apple IIe 128K mode
+
+The emulator keeps the Apple II+ 64K profile for older software and can also run as a 6502-based Apple IIe with 128K. Apple ROM code is not distributed with this repository. To enable the IIe profile, provide a legally obtained, unmodified 16K Apple IIe ROM image at:
+
+```text
+/apple2/roms/apple2e.rom
+```
+
+At the disk selector, press **Tab** to switch between `APPLE II+ 64K` and `APPLE IIE 128K`, then choose the disk with **Enter**. If the ROM is missing or is not exactly 16,384 bytes, IIe mode remains unavailable. The selected machine profile is preserved when reopening the disk selector with **Ctrl+Alt+Delete**.
+
+IIe mode implements the 64K auxiliary bank, `80STORE`, `RAMRD`, `RAMWRT`, `ALTZP`, internal-ROM selection, 80-column text, double low resolution, and double high resolution. The original IIe profile deliberately retains the NMOS 6502 CPU; an Enhanced IIe ROM requiring 65C02 instructions is not currently supported.
+
 For a large archive, generate the index on the computer before copying the archive to the SD card:
 
 ```bash

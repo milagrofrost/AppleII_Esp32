@@ -36,6 +36,8 @@ int bload(char *filename);
 #define GRX 4 /* 0100 */
 #define SPL 8 /* 1000 */
 
+extern int gm;
+
 /* VIDEO */
 void virtinit ();
 void virtline (unsigned int rastline);
