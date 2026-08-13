@@ -122,11 +122,18 @@ static const uint8_t dhgrToAppleColor[16] = {
   0x9, 0xB, 0xD, 0xF
 };
 
-// Exact 2x nearest-neighbor expansion into the centered 560x384 Apple II
-// output rectangle. The canvas origin supplies the physical (40,48) offset.
+static_assert(APPLE_OUTPUT_X + (APPLE_SOURCE_WIDTH - 1) * APPLE_SCALE + APPLE_SCALE - 1 == 599,
+              "Apple output right edge must be x=599");
+static_assert(APPLE_OUTPUT_Y + (APPLE_SOURCE_HEIGHT - 1) * APPLE_SCALE + APPLE_SCALE - 1 == 431,
+              "Apple output bottom edge must be y=431");
+
+// Exact 2x expansion using physical framebuffer coordinates. Canvas origin
+// remains (0,0) for Apple video and host UI alike.
 static inline void SetApplePixel(int x, int y, Color color) {
-	int scaledX = x * 2;
-	int scaledY = y * 2;
+	if ((unsigned) x >= APPLE_SOURCE_WIDTH || (unsigned) y >= APPLE_SOURCE_HEIGHT)
+		return;
+	int scaledX = APPLE_OUTPUT_X + x * APPLE_SCALE;
+	int scaledY = APPLE_OUTPUT_Y + y * APPLE_SCALE;
 	canvas.setPixel(scaledX,     scaledY,     color);
 	canvas.setPixel(scaledX + 1, scaledY,     color);
 	canvas.setPixel(scaledX,     scaledY + 1, color);

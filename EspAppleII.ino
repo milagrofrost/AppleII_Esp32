@@ -30,9 +30,6 @@
 #define VIDEO_400X300_OVER_640X480  // native 640x480 canvas and centered Apple II raster
 //#define VGA_320x200_70Hz      // Smaller screen
 
-// Center the exact 2x Apple II raster (560x384) in the native 640x480 canvas.
-#define VGA_CANVAS_OFFSET_X 40
-#define VGA_CANVAS_OFFSET_Y 48
 #define VGA_ALIGNMENT_MARKERS 0
 
 // SD-backed boot disk support
@@ -41,7 +38,6 @@
 #include "Timer.h"                    // https://github.com/JChristensen/Timer
 #include "fabgl.h"
 #include "common.h"
-#include "esp_heap_caps.h"
 
 fabgl::PS2Controller    PS2Controller;          // PS/2 keyboard controller
 fabgl::VGA16Controller  VGAController;          // VGA video controller
@@ -58,6 +54,31 @@ static void ConfigureAppleIIPalette() {
   for (int index = 0; index < 16; index++)
     VGAController.setPaletteItem(index, appleIIPalette[index]);
 }
+
+#if ENABLE_VGA_GEOMETRY_TEST
+static void DrawVGAGeometryTest() {
+  canvas.setOrigin(0, 0);
+  canvas.setBrushColor((Color) 0);
+  canvas.clear();
+  canvas.setPenColor((Color) 15);
+  canvas.drawRectangle(0, 0, canvas.getWidth() - 1, canvas.getHeight() - 1);
+  canvas.setPenColor((Color) 13);
+  canvas.drawRectangle(APPLE_OUTPUT_X, APPLE_OUTPUT_Y,
+                       APPLE_OUTPUT_X + APPLE_OUTPUT_WIDTH - 1,
+                       APPLE_OUTPUT_Y + APPLE_OUTPUT_HEIGHT - 1);
+  canvas.setPenColor((Color) 6);
+  canvas.drawLine(320, 0, 320, canvas.getHeight() - 1);
+  canvas.setPenColor((Color) 12);
+  canvas.drawLine(0, 240, canvas.getWidth() - 1, 240);
+  canvas.setPenColor((Color) 3);
+  canvas.drawRectangle(220, 140, 419, 339);
+  char dimensions[40];
+  snprintf(dimensions, sizeof(dimensions), "CANVAS %d x %d",
+           canvas.getWidth(), canvas.getHeight());
+  canvas.setPenColor((Color) 15);
+  canvas.drawText(8, 8, dimensions);
+}
+#endif
 
 #if ENABLE_VGA_PALETTE_TEST
 static void DrawVGAPaletteTest() {
@@ -87,7 +108,6 @@ void DrawVGAAlignmentMarkers() {
   // pixels. Anchor all four edges so later Apple II content cannot cause the
   // television to reinterpret the left edge. Work in physical canvas
   // coordinates, independently of the Apple II safe-area origin.
-  fabgl::Point savedOrigin = canvas.getOrigin();
   canvas.setOrigin(0, 0);
   int right = canvas.getWidth() - 1;
   int bottom = canvas.getHeight() - 1;
@@ -95,7 +115,6 @@ void DrawVGAAlignmentMarkers() {
   canvas.setPixel(right, 0, Color::BrightWhite);
   canvas.setPixel(0, bottom, Color::BrightWhite);
   canvas.setPixel(right, bottom, Color::BrightWhite);
-  canvas.setOrigin(savedOrigin);
 #endif
 }
 
@@ -453,9 +472,11 @@ void setup()
   VGAController.setResolution(VGA_320x200_70Hz);
   #endif
 
-  DEBUG_PRINTF("[VIDEO] framebuffer actual=%dx%d freeHeap=%u largestBlock=%u maxAlloc=%u\n",
-               canvas.getWidth(), canvas.getHeight(), ESP.getFreeHeap(),
-               (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+  canvas.setOrigin(0, 0);
+  fabgl::Point physicalOrigin = canvas.getOrigin();
+  DEBUG_PRINTF("[VIDEO] canvas=%dx%d origin=%d,%d screen=%dx%d freeHeap=%u maxAlloc=%u\n",
+               canvas.getWidth(), canvas.getHeight(), physicalOrigin.X, physicalOrigin.Y,
+               VGAController.getScreenWidth(), VGAController.getScreenHeight(), ESP.getFreeHeap(),
                ESP.getMaxAllocHeap());
 
   // FabGL restores its default VGA16 palette in setResolution(), so install
@@ -468,12 +489,8 @@ void setup()
 
   canvas.setBrushColor(Color::Black);
   canvas.clear();
-  canvas.setOrigin(VGA_CANVAS_OFFSET_X, VGA_CANVAS_OFFSET_Y);
+  canvas.setOrigin(0, 0);
   DrawVGAAlignmentMarkers();
-  DEBUG_PRINTF("[VIDEO] canvas inset x=%d y=%d, signal=%dx%d canvas=%dx%d\n",
-               VGA_CANVAS_OFFSET_X, VGA_CANVAS_OFFSET_Y,
-               VGAController.getScreenWidth(), VGAController.getScreenHeight(),
-               canvas.getWidth(), canvas.getHeight());
 
   canvas.selectFont(&fabgl::FONT_8x8);
  
@@ -482,6 +499,13 @@ void setup()
 #if ENABLE_VGA_PALETTE_TEST
   DrawVGAPaletteTest();
   DEBUG_PRINTLN("[VIDEO] raw VGA16 Apple II palette test active");
+  for (;;)
+    delay(1000);
+#endif
+
+#if ENABLE_VGA_GEOMETRY_TEST
+  DrawVGAGeometryTest();
+  DEBUG_PRINTLN("[VIDEO] physical VGA geometry test active");
   for (;;)
     delay(1000);
 #endif

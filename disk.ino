@@ -652,7 +652,6 @@ static void DrawDiskMenu(int selected) {
 
 int SelectDiskImage() {
   auto keyboard = PS2Controller.keyboard();
-  fabgl::Point appleOrigin = canvas.getOrigin();
   canvas.setOrigin(0, 0);
   int selected = 0;
   bool released = false;
@@ -756,7 +755,6 @@ int SelectDiskImage() {
     }
   }
 
-  canvas.setOrigin(appleOrigin);
   return DiskMenuMatchCount ? DiskMenuMatches[selected] : 0;
 }
 

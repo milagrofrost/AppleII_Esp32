@@ -11,6 +11,12 @@
 #define ENABLE_VGA_PALETTE_TEST 0
 #endif
 
+// Set to 1 to draw physical framebuffer/output geometry and stop before
+// starting PS/2, SD, or emulation.
+#ifndef ENABLE_VGA_GEOMETRY_TEST
+#define ENABLE_VGA_GEOMETRY_TEST 0
+#endif
+
 #if ESPAPPLEII_RELEASE
   #define ENABLE_SERIAL_DEBUG 0
   #define ENABLE_CPU_TRACE 0

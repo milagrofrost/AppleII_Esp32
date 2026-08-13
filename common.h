@@ -19,6 +19,14 @@
 *****************************************************************************/
 
 #include "build_config.h"
+
+#define APPLE_SOURCE_WIDTH  280
+#define APPLE_SOURCE_HEIGHT 192
+#define APPLE_SCALE         2
+#define APPLE_OUTPUT_WIDTH  (APPLE_SOURCE_WIDTH * APPLE_SCALE)
+#define APPLE_OUTPUT_HEIGHT (APPLE_SOURCE_HEIGHT * APPLE_SCALE)
+#define APPLE_OUTPUT_X      40
+#define APPLE_OUTPUT_Y      48
 #include "machine.h"
 
 #if ENABLE_SERIAL_DEBUG
