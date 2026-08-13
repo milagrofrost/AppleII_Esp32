@@ -23,14 +23,14 @@
 #include "font.h"
 
 int gm;
-static  Color COL_HGR0  = Color::Black;
-static  Color COL_HGR1  = Color::BrightGreen;
-static  Color COL_HGR2  = Color::BrightMagenta;
-static  Color COL_HGR3  = Color::BrightWhite;
-static  Color COL_HGR4  = Color::Black;
-static  Color COL_HGR5  = Color::BrightYellow;
-static  Color COL_HGR6  = Color::BrightBlue;
-static  Color COL_HGR7  = Color::BrightWhite;
+static  Color COL_HGR0  = (Color) 0;   // black
+static  Color COL_HGR1  = (Color) 12;  // green
+static  Color COL_HGR2  = (Color) 3;   // violet
+static  Color COL_HGR3  = (Color) 15;  // white
+static  Color COL_HGR4  = (Color) 0;   // black
+static  Color COL_HGR5  = (Color) 9;   // orange
+static  Color COL_HGR6  = (Color) 6;   // blue
+static  Color COL_HGR7  = (Color) 15;  // white
 
 /* even columns */
 static Color colourtabe[8]  = {COL_HGR0, COL_HGR0, COL_HGR2, COL_HGR3, COL_HGR0, COL_HGR1, COL_HGR3, COL_HGR3};
@@ -108,10 +108,18 @@ void InvalidateVideoCaches() {
 // reproduce every shade exactly, but this preserves their color families and
 // is far closer than treating every non-black value as white.
 static Color const loresPalette[16] = {
-  Color::Black,         Color::Magenta,       Color::Blue,          Color::BrightMagenta,
-  Color::Green,         Color::White,         Color::Cyan,          Color::BrightBlue,
-  Color::Yellow,        Color::BrightRed,     Color::BrightBlack,   Color::BrightMagenta,
-  Color::BrightGreen,   Color::BrightYellow,  Color::BrightCyan,    Color::BrightWhite
+  (Color) 0,  (Color) 1,  (Color) 2,  (Color) 3,
+  (Color) 4,  (Color) 5,  (Color) 6,  (Color) 7,
+  (Color) 8,  (Color) 9,  (Color) 10, (Color) 11,
+  (Color) 12, (Color) 13, (Color) 14, (Color) 15
+};
+
+// AppleWin/EspAppleII DHR bit-pattern to Apple II color-number permutation.
+static const uint8_t dhgrToAppleColor[16] = {
+  0x0, 0x2, 0x4, 0x6,
+  0x8, 0xA, 0xC, 0xE,
+  0x1, 0x3, 0x5, 0x7,
+  0x9, 0xB, 0xD, 0xF
 };
 
 /***************************************************************************************************************************************/
@@ -304,8 +312,9 @@ void virtline(unsigned int rastline)
 						  | (dots[sourceDot + 1] << 1)
 						  | (dots[sourceDot + 2] << 2)
 						  | (dots[sourceDot + 3] << 3);
-						canvas.setPixel(colorPixel * 2, rastline * 8 + line, loresPalette[colorIndex]);
-						canvas.setPixel(colorPixel * 2 + 1, rastline * 8 + line, loresPalette[colorIndex]);
+						Color color = loresPalette[dhgrToAppleColor[colorIndex]];
+						canvas.setPixel(colorPixel * 2, rastline * 8 + line, color);
+						canvas.setPixel(colorPixel * 2 + 1, rastline * 8 + line, color);
 					}
 				}
 				return;

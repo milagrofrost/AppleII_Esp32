@@ -48,6 +48,40 @@ fabgl::PS2Controller    PS2Controller;          // PS/2 keyboard controller
 fabgl::VGA16Controller  VGAController;          // VGA video controller
 fabgl::Canvas           canvas(&VGAController);
 
+static const fabgl::RGB888 appleIIPalette[16] = {
+  {  0,   0,   0}, {170,   0,  85}, {  0,   0, 170}, {170,   0, 255},
+  {  0,  85,   0}, { 85,  85,  85}, {  0, 170, 255}, {170, 170, 255},
+  { 85,  85,   0}, {255,  85,   0}, {170, 170, 170}, {255, 170, 255},
+  { 85, 255,   0}, {255, 255,   0}, { 85, 255, 170}, {255, 255, 255}
+};
+
+static void ConfigureAppleIIPalette() {
+  for (int index = 0; index < 16; index++)
+    VGAController.setPaletteItem(index, appleIIPalette[index]);
+}
+
+#if ENABLE_VGA_PALETTE_TEST
+static void DrawVGAPaletteTest() {
+  canvas.setOrigin(0, 0);
+  int width = canvas.getWidth();
+  int height = canvas.getHeight();
+  int cellWidth = width / 4;
+  int cellHeight = height / 4;
+  for (int index = 0; index < 16; index++) {
+    int left = (index & 3) * cellWidth;
+    int top = (index >> 2) * cellHeight;
+    int right = (index & 3) == 3 ? width - 1 : left + cellWidth - 1;
+    int bottom = (index >> 2) == 3 ? height - 1 : top + cellHeight - 1;
+    canvas.setBrushColor((Color) index);
+    canvas.fillRectangle(left, top, right, bottom);
+    canvas.setPenColor(index == 0 || index == 2 || index == 4 || index == 5 || index == 8
+                       ? (Color) 15 : (Color) 0);
+    char label[2] = { index < 10 ? (char) ('0' + index) : (char) ('A' + index - 10), '\0' };
+    canvas.drawText(left + 8, top + 8, label);
+  }
+}
+#endif
+
 void DrawVGAAlignmentMarkers() {
 #if VGA_ALIGNMENT_MARKERS
   // Some televisions auto-position VGA from the bounding box of non-black
@@ -422,6 +456,10 @@ void setup()
   VGAController.setResolution(VGA_320x200_70Hz);
   #endif
 
+  // FabGL restores its default VGA16 palette in setResolution(), so install
+  // the Apple II palette only after the selected resolution is active.
+  ConfigureAppleIIPalette();
+
   // this speed-up display but may generate flickering
 	VGAController.enableBackgroundPrimitiveExecution(false);
   VGAController.enableBackgroundPrimitiveTimeout(false);
@@ -438,6 +476,13 @@ void setup()
   canvas.selectFont(&fabgl::FONT_8x8);
  
   canvas.setGlyphOptions(GlyphOptions().FillBackground(true));
+
+#if ENABLE_VGA_PALETTE_TEST
+  DrawVGAPaletteTest();
+  DEBUG_PRINTLN("[VIDEO] raw VGA16 Apple II palette test active");
+  for (;;)
+    delay(1000);
+#endif
   
   // Initialize the PS/2 keyboard
   PS2Controller.begin(PS2Preset::KeyboardPort0, KbdMode::NoVirtualKeys);
