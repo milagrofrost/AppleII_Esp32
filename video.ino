@@ -122,6 +122,17 @@ static const uint8_t dhgrToAppleColor[16] = {
   0x9, 0xB, 0xD, 0xF
 };
 
+// Exact 2x nearest-neighbor expansion into the centered 560x384 Apple II
+// output rectangle. The canvas origin supplies the physical (40,48) offset.
+static inline void SetApplePixel(int x, int y, Color color) {
+	int scaledX = x * 2;
+	int scaledY = y * 2;
+	canvas.setPixel(scaledX,     scaledY,     color);
+	canvas.setPixel(scaledX + 1, scaledY,     color);
+	canvas.setPixel(scaledX,     scaledY + 1, color);
+	canvas.setPixel(scaledX + 1, scaledY + 1, color);
+}
+
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
@@ -178,7 +189,7 @@ void virtline(unsigned int rastline)
 							int x1 = (column * 7 + pixel + 1) / 2;
 							if (x1 == x0) x1++;
 							Color color = (glyph & (0x80 >> pixel)) ? COL_HGR7 : COL_HGR0;
-							for (int x = x0; x < x1; x++) canvas.setPixel(x, rastline * 8 + line, color);
+							for (int x = x0; x < x1; x++) SetApplePixel(x, rastline * 8 + line, color);
 						}
 					}
 				}
@@ -227,7 +238,7 @@ void virtline(unsigned int rastline)
 						y = (rastline *8) + line;
 						for (bit = 128; bit > 1; bit = bit >> 1)
 						{
-							canvas.setPixel(x, y, (valBits & bit) ? COL_HGR7 : COL_HGR0);
+							SetApplePixel(x, y, (valBits & bit) ? COL_HGR7 : COL_HGR0);
 							x++; /*next pixel */
 						}	// for bit 
 					}	// for line
@@ -249,7 +260,7 @@ void virtline(unsigned int rastline)
 						Color color = loresPalette[line < 4 ? packed & 0x0F : packed >> 4];
 						int x0 = column * 7 / 2;
 						int x1 = (column + 1) * 7 / 2;
-						for (int x = x0; x < x1; x++) canvas.setPixel(x, rastline * 8 + line, color);
+						for (int x = x0; x < x1; x++) SetApplePixel(x, rastline * 8 + line, color);
 					}
 				}
 				return;
@@ -279,7 +290,7 @@ void virtline(unsigned int rastline)
 					y = (rastline *8) + line;
 					for (bit = 0; bit < 7; bit++)
 					{
-						canvas.setPixel(x, y, loresPalette[val1]);
+						SetApplePixel(x, y, loresPalette[val1]);
 						x++; /*next pixel */
 					}	// for bit 
 				}	// for line
@@ -313,8 +324,8 @@ void virtline(unsigned int rastline)
 						  | (dots[sourceDot + 2] << 2)
 						  | (dots[sourceDot + 3] << 3);
 						Color color = loresPalette[dhgrToAppleColor[colorIndex]];
-						canvas.setPixel(colorPixel * 2, rastline * 8 + line, color);
-						canvas.setPixel(colorPixel * 2 + 1, rastline * 8 + line, color);
+						SetApplePixel(colorPixel * 2, rastline * 8 + line, color);
+						SetApplePixel(colorPixel * 2 + 1, rastline * 8 + line, color);
 					}
 				}
 				return;
@@ -360,7 +371,7 @@ void virtline(unsigned int rastline)
 					Color const * oddPalette = currentByte & 0x80 ? colourtabo2 : colourtabo;
 					for (int pixel = 0; pixel < 7; pixel++) {
 						Color const * palette = ((x + pixel) & 1) ? oddPalette : evenPalette;
-						canvas.setPixel(x + pixel, y, palette[(val >> (pixel + 1)) & 7]);
+						SetApplePixel(x + pixel, y, palette[(val >> (pixel + 1)) & 7]);
 					}
 
 					RAM_HGR_BACK[cacheIndex] = currentByte;

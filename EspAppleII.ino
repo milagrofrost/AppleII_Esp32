@@ -27,14 +27,12 @@
 #endif
 
 // Video mode (define only one)
-#define VIDEO_400X300_OVER_640X480  // 400x300 canvas inside standard 640x480 VGA
+#define VIDEO_400X300_OVER_640X480  // native 640x480 canvas and centered Apple II raster
 //#define VGA_320x200_70Hz      // Smaller screen
 
-// Safe-area inset inside the framebuffer. Some VGA televisions auto-center
-// porch changes, so moving the rendered canvas is more reliable than changing
-// sync timing. This translates pixels only and does not scale the 4:3 output.
-#define VGA_CANVAS_OFFSET_X 0
-#define VGA_CANVAS_OFFSET_Y 0
+// Center the exact 2x Apple II raster (560x384) in the native 640x480 canvas.
+#define VGA_CANVAS_OFFSET_X 40
+#define VGA_CANVAS_OFFSET_Y 48
 #define VGA_ALIGNMENT_MARKERS 0
 
 // SD-backed boot disk support
@@ -43,6 +41,7 @@
 #include "Timer.h"                    // https://github.com/JChristensen/Timer
 #include "fabgl.h"
 #include "common.h"
+#include "esp_heap_caps.h"
 
 fabgl::PS2Controller    PS2Controller;          // PS/2 keyboard controller
 fabgl::VGA16Controller  VGAController;          // VGA video controller
@@ -447,14 +446,17 @@ void setup()
   VGAController.begin();
   
   #ifdef VIDEO_400X300_OVER_640X480
-  // Use standard 640x480 sync/timing for television compatibility, while
-  // retaining the existing centered 400x300 framebuffer. Both are 4:3.
-  VGAController.setResolution(VGA_640x480_60Hz, 400, 300);
+  VGAController.setResolution(VGA_640x480_60Hz, 640, 480);
   #endif
 
   #ifdef VGA_320x200_70Hz
   VGAController.setResolution(VGA_320x200_70Hz);
   #endif
+
+  DEBUG_PRINTF("[VIDEO] framebuffer actual=%dx%d freeHeap=%u largestBlock=%u maxAlloc=%u\n",
+               canvas.getWidth(), canvas.getHeight(), ESP.getFreeHeap(),
+               (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+               ESP.getMaxAllocHeap());
 
   // FabGL restores its default VGA16 palette in setResolution(), so install
   // the Apple II palette only after the selected resolution is active.
