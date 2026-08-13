@@ -286,23 +286,26 @@ void virtline(unsigned int rastline)
 			if (IsIIeMode() && iie80Column && iieDoubleHires) {
 				for (int line = 0; line < 8; line++) {
 					addr = hresaddr[rastline] + hreslineaddr[line] + virthrespage;
-					int outputCell = 0;
-					unsigned int shift = 0;
-					int availableBits = 0;
+					unsigned char dots[560];
+					int dot = 0;
 					for (int byteIndex = 0; byteIndex < 40; byteIndex++) {
 						unsigned char pair[2] = { AUXRAM[addr + byteIndex], RAM[addr + byteIndex] };
-						for (int bank = 0; bank < 2; bank++) {
-							shift |= (unsigned int) (pair[bank] & 0x7F) << availableBits;
-							availableBits += 7;
-							while (availableBits >= 4 && outputCell < 140) {
-								Color color = loresPalette[shift & 0x0F];
-								canvas.setPixel(outputCell * 2, rastline * 8 + line, color);
-								canvas.setPixel(outputCell * 2 + 1, rastline * 8 + line, color);
-								shift >>= 4;
-								availableBits -= 4;
-								outputCell++;
-							}
-						}
+						for (int bank = 0; bank < 2; bank++)
+							for (int bitIndex = 0; bitIndex < 7; bitIndex++)
+								dots[dot++] = (pair[bank] >> bitIndex) & 1;
+					}
+
+					// Four consecutive 560-dot bits form one of the 140 stable DHR
+					// color cells. Keep those groups fixed at the color-burst phase;
+					// overlapping windows produce false cyan/magenta/yellow fringes.
+					for (int colorPixel = 0; colorPixel < 140; colorPixel++) {
+						int sourceDot = colorPixel * 4;
+						unsigned char colorIndex = dots[sourceDot]
+						  | (dots[sourceDot + 1] << 1)
+						  | (dots[sourceDot + 2] << 2)
+						  | (dots[sourceDot + 3] << 3);
+						canvas.setPixel(colorPixel * 2, rastline * 8 + line, loresPalette[colorIndex]);
+						canvas.setPixel(colorPixel * 2 + 1, rastline * 8 + line, loresPalette[colorIndex]);
 					}
 				}
 				return;
@@ -433,15 +436,23 @@ void CheckVideoIO(word Address) {
     }
     case 0xc05e : {
       if (IsIIeMode()) {
-        iieDoubleHires = false;
-        InvalidateVideoCaches();
+        // On the IIe this is AN3 off / double-hi-res enabled.
+        if (!iieDoubleHires) {
+          iieDoubleHires = true;
+          InvalidateVideoCaches();
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E)");
+        }
       }
       return;
     }
     case 0xc05f : {
       if (IsIIeMode()) {
-        iieDoubleHires = true;
-        InvalidateVideoCaches();
+        // On the IIe this is AN3 on / double-hi-res disabled.
+        if (iieDoubleHires) {
+          iieDoubleHires = false;
+          InvalidateVideoCaches();
+          DEBUG_PRINTLN("[VIDEO] double-hi-res disabled ($C05F)");
+        }
       }
       return;
     }

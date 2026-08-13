@@ -34,7 +34,6 @@ static const int DISK_TRACK_COUNT = 35;
 static const int MAX_DISK_HALF_TRACK = (DISK_TRACK_COUNT - 1) * 2;
 static const char * DISK_MOUNT_PATH = "/SD";
 static const char * DISK_DIRECTORY = "/SD/apple2/disks";
-static const char * LEGACY_DISK_PATH = "/SD/apple2/dos33.dsk";
 static const char * DISK_INDEX_PATH = "/SD/apple2/disks/apple2-index.txt";
 static const char * DISK_INDEX_HEADER = "ESPAPPLEII-DISK-INDEX-1";
 static const int MAX_DISK_IMAGES_PSRAM = 4096;
@@ -178,7 +177,7 @@ static void PrepareDiskMenuStorage() {
   size_t psramSize = physicalPSRAMSize < SOC_EXTRAM_DATA_SIZE
                    ? physicalPSRAMSize : SOC_EXTRAM_DATA_SIZE;
   // Two disk buffers plus IIe auxiliary main and language-card storage.
-  size_t reservedForDrives = 2 * DISK_IMAGE_SIZE + 0x18000UL;
+  size_t reservedForDrives = 2 * DISK_IMAGE_SIZE + 0x1C000UL;
   if (psramSize <= reservedForDrives)
     return;
 
@@ -464,9 +463,6 @@ void FindDiskImages() {
   DiskScanLastSerialProgressAt = 0;
   DiskScanLastVGAProgressAt = 0;
 
-  // Keep the milestone-1 location as the default/fallback entry.
-  AddDiskMenuEntry(LEGACY_DISK_PATH, "dos33.dsk");
-
   if (LoadDiskIndex()) {
     DiskCatalogReady = true;
     DEBUG_PRINTF("[SD] Ready with %d prebuilt index entries (capacity=%d pathTooLong=%u)\n",
@@ -475,27 +471,7 @@ void FindDiskImages() {
   }
 
   ReleaseDiskIndexScratch();
-
-  DEBUG_PRINTLN("[SD] No usable prebuilt index; falling back to recursive SD scan");
-  ReportDiskScanProgress(DISK_DIRECTORY, true);
-
-  DIR * rootDirectory = opendir(DISK_DIRECTORY);
-  if (!rootDirectory) {
-    DEBUG_PRINTF("[SD] Directory %s not found; using legacy disk if available\n", DISK_DIRECTORY);
-    return;
-  }
-  closedir(rootDirectory);
-  ScanDiskDirectory(DISK_DIRECTORY, 0);
-
-  // Alphabetize the games while leaving the legacy DOS disk first.
-  if (DiskMenuCount > 2) {
-    ReportDiskScanProgress("SORTING INDEX", true);
-    qsort(DiskMenu + 1, DiskMenuCount - 1, sizeof(DiskMenuEntry), CompareDiskMenuEntries);
-  }
-  DEBUG_PRINTF("[SD] Found %d valid .dsk image(s) in %u directories in %lums (capacity=%d pathTooLong=%u capacitySkipped=%u)\n",
-               DiskMenuCount, DiskScanDirectoryCount, millis() - DiskScanStartedAt, DiskMenuCapacity,
-               DiskScanPathTooLongCount, DiskScanCapacitySkippedCount);
-  DiskCatalogReady = DiskMenuCount > 0;
+  DEBUG_PRINTF("[SD] No usable disk index at %s; directory scan disabled\n", DISK_INDEX_PATH);
 }
 
 static bool ContainsCaseInsensitive(const char * text, const char * query) {
@@ -713,10 +689,17 @@ int SelectDiskImage() {
     }
 
     if (scanCode == 0x0D) {
-      AppleMachineProfile next = IsIIeMode() ? APPLE_II_PLUS_64K : APPLE_IIE_128K;
-      if (!SetMachineProfile(next)) {
+      AppleMachineProfile next = MachineProfile;
+      bool changed = false;
+      for (int attempt = 0; attempt < 3 && !changed; attempt++) {
+        next = next == APPLE_II_PLUS_64K ? APPLE_IIE_128K
+             : next == APPLE_IIE_128K ? APPLE_IIE_ENHANCED_128K
+             : APPLE_II_PLUS_64K;
+        changed = SetMachineProfile(next);
+      }
+      if (!changed) {
         canvas.setPenColor(Color::BrightRed);
-        canvas.drawText(20, canvas.getHeight() - 28, "ADD 16K IIE ROM TO /apple2/roms");
+        canvas.drawText(20, canvas.getHeight() - 28, "NO USABLE IIE ROM IN /apple2/roms");
         delay(900);
       }
       DrawDiskMenu(selected);
@@ -797,7 +780,7 @@ bool LoadBootDiskFromSD() {
   FindDiskImages();
   InitializeMachineProfiles();
   if (DiskMenuCount == 0) {
-    snprintf(DiskLoadError, sizeof(DiskLoadError), "No valid .dsk images found");
+    snprintf(DiskLoadError, sizeof(DiskLoadError), "Missing/invalid apple2-index.txt");
     DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
     fabgl::FileBrowser::unmountSDCard();
     return false;
@@ -1493,6 +1476,24 @@ unsigned long Diff, LeftOverCycles;
 static unsigned long LastRotationCycle = 0;
 static unsigned long RotationCycleRemainder = 0;
 
+void PrintDiskRuntimeState() {
+  struct DriveState * ds = &DrvSt[CurDrv];
+  DEBUG_PRINTF(" disk=D%d motor=%d track=%d idx=%u old=%d q7write=%d",
+               CurDrv + 1, ds->Active, ds->Track, TrkBufIdx,
+               ds->TrkBufOld, ds->Writing);
+}
+
+// A media selector can leave the Disk II motor logically active while the CPU
+// is paused for several seconds.  Start the replacement disk at a clean
+// rotational timestamp so its first controller access never inherits timing
+// from the previous image.
+void ResetDiskRotationTiming() {
+  LastRotationCycle = cycle;
+  LastIO = cycle;
+  RotationCycleRemainder = 0;
+  TrkBufIdx = 0;
+}
+
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
@@ -1511,15 +1512,27 @@ byte ReadDiskIO(word Address) {
     unsigned long rotationElapsed = cycle - LastRotationCycle;
     LastRotationCycle = cycle;
     RotationCycleRemainder += rotationElapsed;
+    unsigned long rotationBytes = RotationCycleRemainder / 32L;
+    RotationCycleRemainder %= 32L;
     writezero = 0;
-    while (RotationCycleRemainder >= 32L) {
-      if (ds -> Writing && writezero) {
-        RangeCheckTBI( & TrkBufIdx);
-        TrackBuffer[TrkBufIdx] = 0;
+    if (rotationBytes) {
+      if (ds -> Writing && !ds -> WritePro) {
+        // A long write delay fills the intervening magnetic media with zeroes.
+        // No more than one complete revolution needs to be touched because any
+        // additional revolutions overwrite the same circular track.
+        unsigned long bytesToClear = rotationBytes > (unsigned long) TrackBufLen
+          ? (unsigned long) TrackBufLen : rotationBytes;
+        for (unsigned long byteIndex = 1; byteIndex < bytesToClear; byteIndex++) {
+          int zeroIndex = (TrkBufIdx + byteIndex) % TrackBufLen;
+          TrackBuffer[zeroIndex] = 0;
+        }
+        writezero = rotationBytes > 1;
       }
-      TrkBufIdx++;
-      RotationCycleRemainder -= 32L;
-      writezero = 1; /* delays >32us cause 0's to be written */
+
+      // Advancing the rotating track is arithmetic rather than a loop. Games
+      // commonly leave the motor on for many seconds between disk accesses;
+      // replaying every elapsed byte here used to stall the CPU task.
+      TrkBufIdx = (TrkBufIdx + (rotationBytes % TrackBufLen)) % TrackBufLen;
     }
     Diff = cycle - LastIO;
     LeftOverCycles = Diff & 31UL;

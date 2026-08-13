@@ -173,17 +173,50 @@ void initTasks() {
 uint64_t EmulationTimingBaseCycles = 0;
 uint64_t EmulationTimingBaseMicros = 0;
 bool EmulationTimingReady = false;
+volatile uint32_t CPUInstructionHeartbeat = 0;
+volatile unsigned short CPUInstructionStartPC = 0;
+volatile unsigned char CPUInstructionOpcode = 0xFF;
+volatile unsigned char CPUExecutionStage = 0;
+unsigned short CPURecentPC[16] = { 0 };
+unsigned char CPURecentOpcode[16] = { 0 };
+unsigned short CPURecentArgument[16] = { 0 };
+unsigned char CPURecentIndex = 0;
+
+static bool EmulationTargetMicros(uint64_t nowMicros, uint64_t * targetMicros) {
+  uint64_t total = TotalCycles;
+  uint64_t baseCycles = EmulationTimingBaseCycles;
+  uint64_t baseMicros = EmulationTimingBaseMicros;
+  if (total < baseCycles || nowMicros < baseMicros) {
+    EmulationTimingBaseCycles = total;
+    EmulationTimingBaseMicros = nowMicros;
+    *targetMicros = nowMicros;
+    return false;
+  }
+
+  uint64_t elapsedCycles = total - baseCycles;
+  // Rebase periodically. Besides keeping the math compact, this ensures a
+  // damaged timestamp cannot turn speaker or CPU pacing into a huge delay.
+  if (elapsedCycles > 10230000ULL) {
+    EmulationTimingBaseCycles = total;
+    EmulationTimingBaseMicros = nowMicros;
+    *targetMicros = nowMicros;
+    return false;
+  }
+  *targetMicros = baseMicros + (elapsedCycles * 1000000ULL) / 1023000ULL;
+  return true;
+}
 
 void PaceSpeakerToEmulatedCycle() {
   if (!EmulationTimingReady)
     return;
 
-  const uint64_t appleClockHz = 1023000ULL;
-  uint64_t targetMicros = EmulationTimingBaseMicros
-    + ((TotalCycles - EmulationTimingBaseCycles) * 1000000ULL) / appleClockHz;
   uint64_t nowMicros = esp_timer_get_time();
-  if (targetMicros > nowMicros)
-    delayMicroseconds((unsigned int) (targetMicros - nowMicros));
+  uint64_t targetMicros;
+  if (EmulationTargetMicros(nowMicros, &targetMicros) && targetMicros > nowMicros) {
+    uint64_t waitMicros = targetMicros - nowMicros;
+    if (waitMicros <= 20000ULL)
+      delayMicroseconds((unsigned int) waitMicros);
+  }
 }
 
 void Task1code( void * pvParameters ){
@@ -206,11 +239,22 @@ void Task1code( void * pvParameters ){
   uint64_t nextPacingCycle = TotalCycles + pacingIntervalCycles;
 #if ENABLE_STACK_TELEMETRY
   unsigned long nextStackReport = millis() + 10000;
+  uint32_t previousReportHeartbeat = CPUInstructionHeartbeat;
+  unsigned short previousReportPC = PC;
 #endif
   
   // Loop Task1
   for(;;) {
+    CPUInstructionStartPC = PC;
+    CPUInstructionOpcode = 0xFF;
+    CPUExecutionStage = 1; // fetching/executing a 6502 instruction
     execCode();
+    CPURecentPC[CPURecentIndex] = CPUInstructionStartPC;
+    CPURecentOpcode[CPURecentIndex] = CPUInstructionOpcode;
+    CPURecentArgument[CPURecentIndex] = argument_addr;
+    CPURecentIndex = (CPURecentIndex + 1) & 0x0F;
+    CPUExecutionStage = 0;
+    CPUInstructionHeartbeat++;
 #if ENABLE_CPU_TRACE
     instructionCount++;
     if (tracesRemaining && instructionCount == nextTrace) {
@@ -241,8 +285,28 @@ void Task1code( void * pvParameters ){
 
 #if ENABLE_STACK_TELEMETRY
     if ((long) (millis() - nextStackReport) >= 0) {
-      DEBUG_PRINTF("[TASK] CPU minimum free stack=%u bytes\n",
+      uint32_t heartbeat = CPUInstructionHeartbeat;
+      uint32_t instructionDelta = heartbeat - previousReportHeartbeat;
+      DEBUG_PRINTF("[CPU-LIVE] heartbeat=%lu delta=%lu PC=%04X opcode=%02X A=%02X X=%02X Y=%02X SP=%02X SR=%02X stack=%u",
+                   (unsigned long) heartbeat, (unsigned long) instructionDelta,
+                   CPUInstructionStartPC, CPUInstructionOpcode,
+                   A, X, Y, STP, SR,
                    (unsigned) uxTaskGetStackHighWaterMark(NULL));
+      PrintDiskRuntimeState();
+      DEBUG_PRINTF(" joy=%u,%u button=%u\n",
+                   (unsigned) HostPaddleValue(0), (unsigned) HostPaddleValue(1),
+                   (unsigned) HostJoystickButton(0));
+      if (instructionDelta && CPUInstructionStartPC == previousReportPC) {
+        DEBUG_PRINT("[CPU-LIVE] repeating-PC history:");
+        for (int historyOffset = 0; historyOffset < 16; historyOffset++) {
+          unsigned char historyIndex = (CPURecentIndex + historyOffset) & 0x0F;
+          DEBUG_PRINTF(" %04X:%02X@%04X", CPURecentPC[historyIndex],
+                       CPURecentOpcode[historyIndex], CPURecentArgument[historyIndex]);
+        }
+        DEBUG_PRINTLN();
+      }
+      previousReportHeartbeat = heartbeat;
+      previousReportPC = CPUInstructionStartPC;
       nextStackReport += 10000;
     }
 #endif
@@ -250,16 +314,23 @@ void Task1code( void * pvParameters ){
     // Pace the emulated machine from accumulated 6502 cycles. This gives the
     // CPU, speaker soft switch, video changes, and Disk II one shared clock.
     if (TotalCycles >= nextPacingCycle) {
-      uint64_t targetMicros = EmulationTimingBaseMicros
-        + ((TotalCycles - EmulationTimingBaseCycles) * 1000000ULL) / appleClockHz;
       uint64_t nowMicros = esp_timer_get_time();
-      if (targetMicros > nowMicros) {
+      uint64_t targetMicros;
+      bool targetValid = EmulationTargetMicros(nowMicros, &targetMicros);
+      if (targetValid && targetMicros > nowMicros) {
         uint64_t waitMicros = targetMicros - nowMicros;
-        if (waitMicros > 1000ULL)
+        if (waitMicros > 20000ULL) {
+          // A normal pacing correction is at most about one 1024-cycle slice.
+          // Never let corrupt/stale timing arithmetic park the CPU task for an
+          // observable length of time.
+          DEBUG_PRINTF("[CPU] pacing anomaly=%lluus; clock rebased\n", waitMicros);
+          EmulationTimingBaseCycles = TotalCycles;
+          EmulationTimingBaseMicros = nowMicros;
+        } else if (waitMicros > 1000ULL)
           delay((unsigned long) (waitMicros / 1000ULL));
         else
           delayMicroseconds((unsigned int) waitMicros);
-      } else if (nowMicros - targetMicros > 250000ULL) {
+      } else if (targetValid && nowMicros - targetMicros > 250000ULL) {
         // Serial output or a slow host-side operation can stall this task.
         // Rebase instead of trying to run above Apple II speed to catch up.
         EmulationTimingBaseCycles = TotalCycles;
@@ -282,6 +353,7 @@ void Task2code( void * pvParameters ){
 
 #if ENABLE_STACK_TELEMETRY
   unsigned long nextStackReport = millis() + 10000;
+  uint32_t lastCPUHeartbeat = CPUInstructionHeartbeat;
 #endif
 
   // Loop Task2
@@ -304,6 +376,14 @@ void Task2code( void * pvParameters ){
     if ((long) (millis() - nextStackReport) >= 0) {
       DEBUG_PRINTF("[TASK] Video minimum free stack=%u bytes\n",
                    (unsigned) uxTaskGetStackHighWaterMark(NULL));
+      uint32_t currentCPUHeartbeat = CPUInstructionHeartbeat;
+      if (currentCPUHeartbeat == lastCPUHeartbeat) {
+        DEBUG_PRINTF("[TASK] CPU STALLED taskState=%d stage=%u PC=%04X opcode=%02X cycle=%lu\n",
+                     Task1 ? (int) eTaskGetState(Task1) : -1,
+                     (unsigned) CPUExecutionStage, CPUInstructionStartPC,
+                     CPUInstructionOpcode, cycle);
+      }
+      lastCPUHeartbeat = currentCPUHeartbeat;
       nextStackReport += 10000;
     }
 #endif

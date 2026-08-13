@@ -852,6 +852,7 @@ void ResetMemorySoftSwitches() {
   ResetIIeSoftSwitches();
 }
 int k=0;
+static uint64_t paddleResetCycle = 0;
 
 static unsigned int LanguageCardIndex(unsigned short address) {
   // A 16K language card has two independent 4K banks at $D000-$DFFF and
@@ -957,6 +958,17 @@ unsigned char read8(unsigned short address) {
     if(address == 0xC019) { 
     } 
     else
+    if(address >= 0xC061 && address <= 0xC063)
+      return IIeStatus(HostJoystickButton(address - 0xC061)); else
+    if(address >= 0xC064 && address <= 0xC067) {
+      int paddle = address - 0xC064;
+      uint64_t elapsed = TotalCycles - paddleResetCycle;
+      return IIeStatus(elapsed < (uint64_t) HostPaddleValue(paddle) * 11ULL + 8ULL);
+    } else
+    if(address == 0xC070) {
+      paddleResetCycle = TotalCycles;
+      return k & 0x7F;
+    } else
     // Speaker toggle
     if(address == 0xC030) speaker_toggle(); else
 		/* Video resolution */
@@ -1012,6 +1024,9 @@ void write8(unsigned short address, unsigned char value) {
   	// Keyboard Strobe
   	if (address == 0xC010) keyboard_strobe();
   	else
+		if (address == 0xC070)
+			paddleResetCycle = TotalCycles;
+		else
   		// Speaker toggle
   		if (address == 0xC030) speaker_toggle();
   		else

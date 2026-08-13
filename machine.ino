@@ -3,23 +3,36 @@
 #include "soc/soc.h"
 
 static const char * IIE_ROM_PATH = "/SD/apple2/roms/apple2e.rom";
+static const char * IIE_ENHANCED_ROM_PATH = "/SD/apple2/roms/apple2e-enhanced.rom";
 
 AppleMachineProfile MachineProfile = APPLE_II_PLUS_64K;
 unsigned char * IIE_ROM = NULL;
 bool IIeROMAvailable = false;
+static unsigned char * OriginalIIeROM = NULL;
+static unsigned char * EnhancedIIeROM = NULL;
+static bool EnhancedIIeROMAvailable = false;
 
 bool IsIIeMode() {
-  return MachineProfile == APPLE_IIE_128K;
+  return MachineProfile != APPLE_II_PLUS_64K;
+}
+
+bool Is65C02Mode() {
+  return MachineProfile == APPLE_IIE_ENHANCED_128K;
 }
 
 const char * MachineProfileName() {
+  if (Is65C02Mode()) return "ENHANCED IIE 128K";
   return IsIIeMode() ? "APPLE IIE 128K" : "APPLE II+ 64K";
 }
 
 bool SetMachineProfile(AppleMachineProfile profile) {
   if (profile == APPLE_IIE_128K && (!IIeROMAvailable || !AUXRAM))
     return false;
+  if (profile == APPLE_IIE_ENHANCED_128K && (!EnhancedIIeROMAvailable || !AUXRAM))
+    return false;
   MachineProfile = profile;
+  if (profile == APPLE_IIE_128K) IIE_ROM = OriginalIIeROM;
+  if (profile == APPLE_IIE_ENHANCED_128K) IIE_ROM = EnhancedIIeROM;
   ResetMemorySoftSwitches();
   InvalidateVideoCaches();
   DEBUG_PRINTF("[MACHINE] selected %s\n", MachineProfileName());
@@ -39,24 +52,30 @@ bool InitializeMachineProfiles() {
   memset(AUXRAM, 0, 0x10000);
   AUXRAMEXT = AUXRAM + 0x10000;
   memset(AUXRAMEXT, 0, 0x4000);
-  IIE_ROM = AUXRAMEXT + 0x4000;
+  OriginalIIeROM = AUXRAMEXT + 0x4000;
+  EnhancedIIeROM = OriginalIIeROM + 0x4000;
+  IIE_ROM = OriginalIIeROM;
 
-  FILE * rom = fopen(IIE_ROM_PATH, "rb");
-  if (!rom) {
-    DEBUG_PRINTF("[MACHINE] IIe ROM not found: %s\n", IIE_ROM_PATH);
-    return false;
-  }
-  fseek(rom, 0, SEEK_END);
-  long size = ftell(rom);
-  rewind(rom);
   const size_t romSize = 0x4000;
-  if (size != (long) romSize || fread(IIE_ROM, 1, romSize, rom) != romSize) {
+  const char * paths[2] = { IIE_ROM_PATH, IIE_ENHANCED_ROM_PATH };
+  unsigned char * targets[2] = { OriginalIIeROM, EnhancedIIeROM };
+  bool * available[2] = { &IIeROMAvailable, &EnhancedIIeROMAvailable };
+  for (int index = 0; index < 2; index++) {
+    FILE * rom = fopen(paths[index], "rb");
+    if (!rom) {
+      DEBUG_PRINTF("[MACHINE] optional ROM not found: %s\n", paths[index]);
+      continue;
+    }
+    fseek(rom, 0, SEEK_END);
+    long size = ftell(rom);
+    rewind(rom);
+    if (size == (long) romSize && fread(targets[index], 1, romSize, rom) == romSize) {
+      *available[index] = true;
+      DEBUG_PRINTF("[MACHINE] loaded %s\n", paths[index]);
+    } else {
+      DEBUG_PRINTF("[MACHINE] ROM must be exactly %u bytes: %s\n", (unsigned) romSize, paths[index]);
+    }
     fclose(rom);
-    DEBUG_PRINTF("[MACHINE] IIe ROM must be exactly %u bytes\n", (unsigned) romSize);
-    return false;
   }
-  fclose(rom);
-  IIeROMAvailable = true;
-  DEBUG_PRINTF("[MACHINE] Apple IIe ROM loaded from %s\n", IIE_ROM_PATH);
-  return true;
+  return IIeROMAvailable || EnhancedIIeROMAvailable;
 }

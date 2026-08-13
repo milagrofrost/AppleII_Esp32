@@ -42,6 +42,10 @@ extern uint64_t TotalCycles;
 extern uint64_t EmulationTimingBaseCycles;
 extern uint64_t EmulationTimingBaseMicros;
 extern bool EmulationTimingReady;
+extern unsigned short CPURecentPC[16];
+extern unsigned char CPURecentOpcode[16];
+extern unsigned short CPURecentArgument[16];
+extern unsigned char CPURecentIndex;
 void PaceSpeakerToEmulatedCycle();
 
 // CPU entry points required by the runtime task.
@@ -52,6 +56,9 @@ void InvalidateVideoCaches();
 extern bool iie80Column;
 extern bool iieAltCharset;
 extern bool iieDoubleHires;
+unsigned char HostPaddleValue(int paddle);
+bool HostJoystickButton(int button);
+void PrintDiskRuntimeState();
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();

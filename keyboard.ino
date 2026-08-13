@@ -48,7 +48,22 @@ boolean shift_enabled = false;
 static bool HostCtrlDown = false;
 static bool HostAltDown = false;
 static bool HostDeleteDown = false;
+static bool HostSwapKeyActive = false;
 static bool HostBreakPending = false;
+static bool HostExtendedPending = false;
+static volatile bool HostLeftDown = false, HostRightDown = false;
+static volatile bool HostUpDown = false, HostDownDown = false;
+static volatile bool HostButton0Down = false;
+
+unsigned char HostPaddleValue(int paddle) {
+  if (paddle == 0) return HostLeftDown ? 0 : (HostRightDown ? 255 : 127);
+  if (paddle == 1) return HostUpDown ? 0 : (HostDownDown ? 255 : 127);
+  return 127;
+}
+
+bool HostJoystickButton(int button) {
+  return button == 0 && HostButton0Down;
+}
 
 // In apple II scancode format
 volatile unsigned char keymem = 0;
@@ -121,6 +136,41 @@ static void HostDiskManagerTrigger() {
   }
 }
 
+static void HostDrive1SwapTrigger() {
+  DEBUG_PRINTLN("[HOST] Ctrl+Alt+S requested: pausing for drive-1 media swap");
+
+  if (Task1 != NULL)
+    vTaskSuspend(Task1);
+
+  FindDiskImages();
+  if (DiskMenuCount == 0) {
+    DEBUG_PRINTLN("[HOST] No indexed disk images are available for media swap");
+    if (Task1 != NULL)
+      vTaskResume(Task1);
+    return;
+  }
+
+  int selected = SelectDiskImage();
+  DEBUG_PRINTF("[HOST] Hot-swapping drive 1 to %s\n", DiskEntryPath(selected));
+  if (LoadDiskImageForDrive(0, DiskEntryPath(selected))) {
+    snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskEntryName(selected));
+    ResetDiskRotationTiming();
+    // The selector overwrites the framebuffer. Preserve all emulated state,
+    // but force video to repaint it when the CPU resumes.
+    InvalidateVideoCaches();
+    canvas.setBrushColor(Color::Black);
+    canvas.clear();
+    DrawVGAAlignmentMarkers();
+    DEBUG_PRINTF("[HOST] drive 1 media swapped without reset: %s PC=%04X\n",
+                 LoadedDiskName, PC);
+  } else {
+    DEBUG_PRINTF("[HOST] drive 1 media swap failed: %s\n", DiskLoadError);
+  }
+
+  if (Task1 != NULL)
+    vTaskResume(Task1);
+}
+
 /***************************************************************************************************************************************/
 //
 /***************************************************************************************************************************************/
@@ -130,11 +180,38 @@ void keyboard_In(int keyPush) {
   // translated into an Apple II key. Track PS/2 make and break sequences
   // without swallowing their bytes, so the normal raw-scancode parser remains
   // synchronized after returning from the disk menu.
-  if (keyPush == 0xF0) {
+  if (keyPush == 0xE0) {
+    HostExtendedPending = true;
+  } else if (keyPush == 0xF0) {
     HostBreakPending = true;
-  } else if (keyPush != 0xE0) {
+  } else {
     bool keyDown = !HostBreakPending;
     HostBreakPending = false;
+
+    if (HostExtendedPending) {
+      if (keyPush == 0x6B) HostLeftDown = keyDown;
+      else if (keyPush == 0x74) HostRightDown = keyDown;
+      else if (keyPush == 0x75) HostUpDown = keyDown;
+      else if (keyPush == 0x72) HostDownDown = keyDown;
+      HostExtendedPending = false;
+    } else if (keyPush == 0x29) {
+      HostButton0Down = keyDown;
+    }
+
+    if (keyPush == 0x1B && HostSwapKeyActive) {
+      if (!keyDown)
+        HostSwapKeyActive = false;
+      keyboard_mbyte = 0;
+      return;
+    }
+
+    if (keyDown && keyPush == 0x1B && HostCtrlDown && HostAltDown) {
+      HostSwapKeyActive = true;
+      HostDrive1SwapTrigger();
+      keyboard_mbyte = 0;
+      keyboard_data[0] = keyboard_data[1] = keyboard_data[2] = 0;
+      return;
+    }
 
     if (keyPush == 0x14)
       HostCtrlDown = keyDown;
