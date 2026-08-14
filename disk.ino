@@ -64,18 +64,52 @@ static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
   }
 
   FILE * save = fopen(DriveSavePath[drive], "rb");
-  if (!save)
-    return sourcePath;
-  fseek(save, 0, SEEK_END);
-  long saveSize = ftell(save);
-  fclose(save);
-  if (saveSize == (long) DISK_IMAGE_SIZE) {
-    DEBUG_PRINTF("[DISK] drive %d loading writable save image %s\n",
+  if (save) {
+    fseek(save, 0, SEEK_END);
+    long saveSize = ftell(save);
+    fclose(save);
+    if (saveSize == (long) DISK_IMAGE_SIZE) {
+      DEBUG_PRINTF("[DISK] drive %d loading writable save image %s\n",
+                   drive + 1, DriveSavePath[drive]);
+      return DriveSavePath[drive];
+    }
+    DEBUG_PRINTF("[DISK] replacing invalid save image size=%ld path=%s\n",
+                 saveSize, DriveSavePath[drive]);
+  }
+
+  // Create the copy-on-write base while emulation is stopped in the disk
+  // selector. Runtime track flushes can then update only their 256-byte
+  // sectors instead of blocking the CPU to write a complete image.
+  FILE * source = fopen(sourcePath, "rb");
+  save = source ? fopen(DriveSavePath[drive], "wb") : NULL;
+  unsigned char * copyBuffer = save ? (unsigned char *) malloc(16384) : NULL;
+  size_t copied = 0;
+  while (copyBuffer && copied < DISK_IMAGE_SIZE) {
+    size_t chunk = DISK_IMAGE_SIZE - copied;
+    if (chunk > 16384)
+      chunk = 16384;
+    size_t bytesRead = fread(copyBuffer, 1, chunk, source);
+    if (bytesRead != chunk || fwrite(copyBuffer, 1, chunk, save) != chunk)
+      break;
+    copied += chunk;
+  }
+  if (copyBuffer)
+    free(copyBuffer);
+  if (save)
+    fclose(save);
+  if (source)
+    fclose(source);
+
+  if (copied == DISK_IMAGE_SIZE) {
+    DEBUG_PRINTF("[DISK] drive %d prepared writable save image %s\n",
                  drive + 1, DriveSavePath[drive]);
     return DriveSavePath[drive];
   }
-  DEBUG_PRINTF("[DISK] ignoring invalid save image size=%ld path=%s\n",
-               saveSize, DriveSavePath[drive]);
+
+  remove(DriveSavePath[drive]);
+  DEBUG_PRINTF("[DISK] unable to prepare writable save image; drive %d will be read-only\n",
+               drive + 1);
+  DriveSavePath[drive][0] = '\0';
   return sourcePath;
 }
 
@@ -1092,34 +1126,32 @@ void writeSector(int drvAtivo, void * buf, size_t size) {
 
   unsigned char * driveBuffer = DrvSt[drvAtivo].DiskBuffer;
   memcpy(driveBuffer + SeekPos, buf, size);
+}
 
-  FILE * save = fopen(DriveSavePath[drvAtivo], "r+b");
+static bool PersistDriveRange(int drive, size_t offset, size_t size) {
+  if (drive < 0 || drive > 1 || DrvSt[drive].WritePro ||
+      !DrvSt[drive].DiskBuffer || !DriveSavePath[drive][0] ||
+      offset > DISK_IMAGE_SIZE || size > DISK_IMAGE_SIZE - offset)
+    return false;
+
+  FILE * save = fopen(DriveSavePath[drive], "r+b");
   if (!save) {
-    save = fopen(DriveSavePath[drvAtivo], "wb");
-    if (save) {
-      size_t written = fwrite(driveBuffer, 1, DISK_IMAGE_SIZE, save);
-      fclose(save);
-      if (written == DISK_IMAGE_SIZE) {
-        DEBUG_PRINTF("[DISK] created writable save image %s\n",
-                     DriveSavePath[drvAtivo]);
-        return;
-      }
-    }
-    DrvSt[drvAtivo].WritePro = 1;
-    DEBUG_PRINTF("[DISK] ERROR creating save image; drive %d is now write-protected: %s\n",
-                 drvAtivo + 1, DriveSavePath[drvAtivo]);
-    return;
+    DrvSt[drive].WritePro = 1;
+    DEBUG_PRINTF("[DISK] ERROR opening save image; drive %d is now write-protected: %s\n",
+                 drive + 1, DriveSavePath[drive]);
+    return false;
   }
 
-  bool persisted = fseek(save, SeekPos, SEEK_SET) == 0 &&
-                   fwrite(buf, 1, size, save) == size;
+  bool persisted = fseek(save, offset, SEEK_SET) == 0 &&
+                   fwrite(DrvSt[drive].DiskBuffer + offset, 1, size, save) == size;
   fflush(save);
   fclose(save);
   if (!persisted) {
-    DrvSt[drvAtivo].WritePro = 1;
+    DrvSt[drive].WritePro = 1;
     DEBUG_PRINTF("[DISK] ERROR persisting save; drive %d is now write-protected: %s\n",
-                 drvAtivo + 1, DriveSavePath[drvAtivo]);
+                 drive + 1, DriveSavePath[drive]);
   }
+  return persisted;
 }
 
 /***************************************************************************************************************************************/
@@ -1507,6 +1539,7 @@ void DeNibbliseTrack(struct DriveState * ds) {
 /***************************************************************************************************************************************/
 void WriteTrack(struct DriveState * ds) {
   int idx;
+  int drive = (int) (ds - DrvSt);
 
   /* fill any unused space in buffer with 0xff's */
   if (TrackBufLen < 0x1a00) {
@@ -1519,11 +1552,13 @@ void WriteTrack(struct DriveState * ds) {
     /* Disk ][ track/byte format (0x1a00 bytes/track) - just write the bytes */
     lseekDisk(ds -> DiskFH, (long)(ds -> Track >> 1) * 0x1a00L, SEEK_SET);
     writeSector((int) (ds - DrvSt), TrackBuffer, 0x1a00);
+    PersistDriveRange(drive, (size_t) (ds -> Track >> 1) * 0x1a00, 0x1a00);
   }
   if (ds -> DiskType == DOSType || ds -> DiskType == ProDOSType ||
     ds -> DiskType == SimsysType || ds -> DiskType == XgsType) {
     /* Track/sector format (4096 bytes/track) - translate from Disk ][ format */
     DeNibbliseTrack(ds);
+    PersistDriveRange(drive, (size_t) (ds -> Track >> 1) * 4096, 4096);
   }
   ds -> DiskSize = FileSize(ds -> DiskFH);
   if (ds -> DiskSize < 143360) ds -> DiskSize = 143360; // uso. 2002.1109
