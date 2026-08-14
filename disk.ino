@@ -44,6 +44,7 @@ unsigned char * DiskImage = NULL;
 unsigned char * DriveDiskImage[2] = { NULL, NULL };
 static bool DiskPSRAMReady = false;
 static bool DriveDiskImageHeapAllocated[2] = { false, false };
+static char DriveSavePath[2][MAX_DISK_PATH + 16] = {{0}, {0}};
 char DiskLoadError[96] = "Disk image has not been loaded";
 char LoadedDiskName[64] = "";
 static unsigned int DiskReadTraceCount = 0;
@@ -52,6 +53,31 @@ static unsigned int DiskTrackTraceCount = 0;
 static unsigned int DiskIOTraceCount = 0;
 static unsigned long DiskHeadPositionChangedAt = 0;
 #endif
+
+static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
+  if (drive < 0 || drive > 1 || !sourcePath ||
+      snprintf(DriveSavePath[drive], sizeof(DriveSavePath[drive]),
+               "%s.sav.dsk", sourcePath) >= (int) sizeof(DriveSavePath[drive])) {
+    if (drive >= 0 && drive <= 1)
+      DriveSavePath[drive][0] = '\0';
+    return sourcePath;
+  }
+
+  FILE * save = fopen(DriveSavePath[drive], "rb");
+  if (!save)
+    return sourcePath;
+  fseek(save, 0, SEEK_END);
+  long saveSize = ftell(save);
+  fclose(save);
+  if (saveSize == (long) DISK_IMAGE_SIZE) {
+    DEBUG_PRINTF("[DISK] drive %d loading writable save image %s\n",
+                 drive + 1, DriveSavePath[drive]);
+    return DriveSavePath[drive];
+  }
+  DEBUG_PRINTF("[DISK] ignoring invalid save image size=%ld path=%s\n",
+               saveSize, DriveSavePath[drive]);
+  return sourcePath;
+}
 
 struct DiskMenuEntry {
   uint32_t pathOffset;
@@ -792,7 +818,8 @@ bool LoadBootDiskFromSD() {
   int selected = SelectDiskImage();
 
   DEBUG_PRINTF("[SD] Selected %s\n", DiskEntryPath(selected));
-  FILE * imageFile = fopen(DiskEntryPath(selected), "rb");
+  const char * bootImagePath = ConfigureDriveSavePath(0, DiskEntryPath(selected));
+  FILE * imageFile = fopen(bootImagePath, "rb");
   if (!imageFile) {
     snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot open selected disk");
     DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
@@ -963,7 +990,8 @@ bool LoadDiskImageForDrive(int drive, const char * path) {
     return false;
   }
 
-  FILE * imageFile = fopen(path, "rb");
+  const char * imagePath = ConfigureDriveSavePath(drive, path);
+  FILE * imageFile = fopen(imagePath, "rb");
   if (!imageFile) {
     snprintf(DiskLoadError, sizeof(DiskLoadError), "Cannot open drive %d image", drive + 1);
     DEBUG_PRINTF("[SD] ERROR: %s: %s\n", DiskLoadError, path);
@@ -1021,7 +1049,7 @@ bool LoadDiskImageForDrive(int drive, const char * path) {
   DriveDiskImageHeapAllocated[drive] = payloadHeapAllocated;
   DrvSt[drive].DiskBuffer = payload;
   DrvSt[drive].DiskSize = DISK_IMAGE_SIZE;
-  DrvSt[drive].WritePro = 1;
+  DrvSt[drive].WritePro = DriveSavePath[drive][0] ? 0 : 1;
   if (DrvSt[drive].Track > MAX_DISK_HALF_TRACK)
     DrvSt[drive].Track = MAX_DISK_HALF_TRACK;
   // Force the emulated drive to rebuild its nibblized track from the new
@@ -1057,7 +1085,41 @@ void readSector(int drvAtivo, void * buf, size_t size) {
 
 /***************************************************************************************************************************************/
 void writeSector(int drvAtivo, void * buf, size_t size) {
-  // SD-backed images are deliberately read-only.
+  if (drvAtivo < 0 || drvAtivo > 1 || DrvSt[drvAtivo].WritePro ||
+      !DrvSt[drvAtivo].DiskBuffer || !DriveSavePath[drvAtivo][0] ||
+      SeekPos > DISK_IMAGE_SIZE || size > DISK_IMAGE_SIZE - SeekPos)
+    return;
+
+  unsigned char * driveBuffer = DrvSt[drvAtivo].DiskBuffer;
+  memcpy(driveBuffer + SeekPos, buf, size);
+
+  FILE * save = fopen(DriveSavePath[drvAtivo], "r+b");
+  if (!save) {
+    save = fopen(DriveSavePath[drvAtivo], "wb");
+    if (save) {
+      size_t written = fwrite(driveBuffer, 1, DISK_IMAGE_SIZE, save);
+      fclose(save);
+      if (written == DISK_IMAGE_SIZE) {
+        DEBUG_PRINTF("[DISK] created writable save image %s\n",
+                     DriveSavePath[drvAtivo]);
+        return;
+      }
+    }
+    DrvSt[drvAtivo].WritePro = 1;
+    DEBUG_PRINTF("[DISK] ERROR creating save image; drive %d is now write-protected: %s\n",
+                 drvAtivo + 1, DriveSavePath[drvAtivo]);
+    return;
+  }
+
+  bool persisted = fseek(save, SeekPos, SEEK_SET) == 0 &&
+                   fwrite(buf, 1, size, save) == size;
+  fflush(save);
+  fclose(save);
+  if (!persisted) {
+    DrvSt[drvAtivo].WritePro = 1;
+    DEBUG_PRINTF("[DISK] ERROR persisting save; drive %d is now write-protected: %s\n",
+                 drvAtivo + 1, DriveSavePath[drvAtivo]);
+  }
 }
 
 /***************************************************************************************************************************************/
@@ -1824,7 +1886,7 @@ void MountDisk(int disk) {
     attr = 0;
   }
   //    ds->WritePro = ( attr & FA_RDONLY ) ? 1 : 0;
-  ds -> WritePro = 1;
+  ds -> WritePro = DriveSavePath[disk][0] ? 0 : 1;
   ds -> DiskFH = openDisk(ds -> DiskFN, (ds -> WritePro ? O_RDONLY : O_RDWR));
   ds -> DiskSize = 0L;
   if (ds -> DiskFH >= 0) {

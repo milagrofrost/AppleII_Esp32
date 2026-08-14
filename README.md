@@ -199,6 +199,8 @@ Press **Ctrl+Alt+Delete** while emulation is running to reopen the disk selector
 
 Press **Ctrl+Alt+S** to replace the disk in drive 1 without resetting the emulated machine. Use this when software asks for another disk side: select the requested side, press **Enter**, then press the key or joystick button requested by the software. RAM, CPU registers, video mode, and the active machine profile are preserved during the swap.
 
+Disk writes use copy-on-write save images. The first successful write creates a neighboring `<original filename>.sav.dsk`; later launches automatically load that save image while leaving the original archive disk unchanged. Delete the `.sav.dsk` file to discard saved progress and return to the original disk state.
+
 The selector is shown even for a one-entry index so the machine profile can still be changed with **Tab**.
 
 ## Serial diagnostics
