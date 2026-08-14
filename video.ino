@@ -323,7 +323,30 @@ void virtline(unsigned int rastline)
 								dots[dot++] = (pair[bank] >> bitIndex) & 1;
 					}
 
-				#if DHR_RENDER_MODE != DHR_COLOR_140
+				#if DHR_RENDER_MODE == DHR_COLOR_280
+					// Reconstruct one output pixel from each pair of canonical DHR
+					// dots. Uniform pairs retain their high-detail black/white value;
+					// mixed pairs take the color of their original four-dot cell.
+					for (int pixel = 0; pixel < 280; pixel++) {
+						int sourceDot = pixel * 2;
+						unsigned char pairBits = dots[sourceDot]
+						  | (dots[sourceDot + 1] << 1);
+						Color color;
+						if (pairBits == 0)
+							color = (Color) 0;
+						else if (pairBits == 3)
+							color = (Color) 15;
+						else {
+							int cellDot = (sourceDot / 4) * 4;
+							unsigned char colorIndex = dots[cellDot]
+							  | (dots[cellDot + 1] << 1)
+							  | (dots[cellDot + 2] << 2)
+							  | (dots[cellDot + 3] << 3);
+							color = loresPalette[dhgrToAppleColor[colorIndex]];
+						}
+						SetApplePixel(pixel, rastline * 8 + line, color);
+					}
+				#elif DHR_RENDER_MODE != DHR_COLOR_140
 					// The 320x200 FabGL canvas cannot display 560 independent
 					// horizontal dots. Preserve the canonical stream through this
 					// point, then apply the selected two-dot monochrome reduction.
@@ -494,6 +517,8 @@ void CheckVideoIO(word Address) {
           InvalidateVideoCaches();
 #if DHR_RENDER_MODE == DHR_COLOR_140
           DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=color-140");
+#elif DHR_RENDER_MODE == DHR_COLOR_280
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=color-280-pair-detail");
 #elif DHR_RENDER_MODE == DHR_MONO_PAIR_AND
           DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-and");
 #elif DHR_RENDER_MODE == DHR_MONO_EVEN

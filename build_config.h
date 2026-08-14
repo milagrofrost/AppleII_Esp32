@@ -19,11 +19,12 @@
 #define DHR_MONO_ODD      3
 #define DHR_MONO_PAIR_AND 4
 #define DHR_MONO_PAIR_XOR 5
+#define DHR_COLOR_280     6
 #ifndef DHR_RENDER_MODE
-#define DHR_RENDER_MODE DHR_COLOR_140
+#define DHR_RENDER_MODE DHR_COLOR_280
 #endif
 
-#if DHR_RENDER_MODE < DHR_COLOR_140 || DHR_RENDER_MODE > DHR_MONO_PAIR_XOR
+#if DHR_RENDER_MODE < DHR_COLOR_140 || DHR_RENDER_MODE > DHR_COLOR_280
 #error "DHR_RENDER_MODE must select one of the defined DHR diagnostic modes"
 #endif
 
