@@ -26,9 +26,8 @@
 #define SHOWTASKCORE
 #endif
 
-// Video mode (define only one)
-#define VIDEO_400X300_OVER_640X480  // native 640x480 canvas and centered Apple II raster
-//#define VGA_320x200_70Hz      // Smaller screen
+// Hardware-confirmed native VGA16 framebuffer mode.
+#define VGA_320x200_70Hz
 
 #define VGA_ALIGNMENT_MARKERS 0
 
@@ -54,31 +53,6 @@ static void ConfigureAppleIIPalette() {
   for (int index = 0; index < 16; index++)
     VGAController.setPaletteItem(index, appleIIPalette[index]);
 }
-
-#if ENABLE_VGA_GEOMETRY_TEST
-static void DrawVGAGeometryTest() {
-  canvas.setOrigin(0, 0);
-  canvas.setBrushColor((Color) 0);
-  canvas.clear();
-  canvas.setPenColor((Color) 15);
-  canvas.drawRectangle(0, 0, canvas.getWidth() - 1, canvas.getHeight() - 1);
-  canvas.setPenColor((Color) 13);
-  canvas.drawRectangle(APPLE_OUTPUT_X, APPLE_OUTPUT_Y,
-                       APPLE_OUTPUT_X + APPLE_OUTPUT_WIDTH - 1,
-                       APPLE_OUTPUT_Y + APPLE_OUTPUT_HEIGHT - 1);
-  canvas.setPenColor((Color) 6);
-  canvas.drawLine(320, 0, 320, canvas.getHeight() - 1);
-  canvas.setPenColor((Color) 12);
-  canvas.drawLine(0, 240, canvas.getWidth() - 1, 240);
-  canvas.setPenColor((Color) 3);
-  canvas.drawRectangle(220, 140, 419, 339);
-  char dimensions[40];
-  snprintf(dimensions, sizeof(dimensions), "CANVAS %d x %d",
-           canvas.getWidth(), canvas.getHeight());
-  canvas.setPenColor((Color) 15);
-  canvas.drawText(8, 8, dimensions);
-}
-#endif
 
 #if ENABLE_VGA_PALETTE_TEST
 static void DrawVGAPaletteTest() {
@@ -464,10 +438,6 @@ void setup()
   VGAController.queueSize = 256;  // trade UI speed using less RAM and allow both WiFi
   VGAController.begin();
   
-  #ifdef VIDEO_400X300_OVER_640X480
-  VGAController.setResolution(VGA_640x480_60Hz, 640, 480);
-  #endif
-
   #ifdef VGA_320x200_70Hz
   VGAController.setResolution(VGA_320x200_70Hz);
   #endif
@@ -478,6 +448,10 @@ void setup()
                canvas.getWidth(), canvas.getHeight(), physicalOrigin.X, physicalOrigin.Y,
                VGAController.getScreenWidth(), VGAController.getScreenHeight(), ESP.getFreeHeap(),
                ESP.getMaxAllocHeap());
+  if (canvas.getWidth() != 320 || canvas.getHeight() != 200) {
+    DEBUG_PRINTF("[VIDEO] WARNING framebuffer mismatch requested=320x200 actual=%dx%d\n",
+                 canvas.getWidth(), canvas.getHeight());
+  }
 
   // FabGL restores its default VGA16 palette in setResolution(), so install
   // the Apple II palette only after the selected resolution is active.
@@ -503,13 +477,6 @@ void setup()
     delay(1000);
 #endif
 
-#if ENABLE_VGA_GEOMETRY_TEST
-  DrawVGAGeometryTest();
-  DEBUG_PRINTLN("[VIDEO] physical VGA geometry test active");
-  for (;;)
-    delay(1000);
-#endif
-  
   // Initialize the PS/2 keyboard
   PS2Controller.begin(PS2Preset::KeyboardPort0, KbdMode::NoVirtualKeys);
 

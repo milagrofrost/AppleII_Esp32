@@ -11,10 +11,20 @@
 #define ENABLE_VGA_PALETTE_TEST 0
 #endif
 
-// Set to 1 to draw physical framebuffer/output geometry and stop before
-// starting PS/2, SD, or emulation.
-#ifndef ENABLE_VGA_GEOMETRY_TEST
-#define ENABLE_VGA_GEOMETRY_TEST 0
+// IIe double-hi-res presentation/reduction modes for the 280-column Apple
+// output area on the confirmed 320x200 FabGL canvas.
+#define DHR_COLOR_140     0
+#define DHR_MONO_PAIR_OR  1
+#define DHR_MONO_EVEN     2
+#define DHR_MONO_ODD      3
+#define DHR_MONO_PAIR_AND 4
+#define DHR_MONO_PAIR_XOR 5
+#ifndef DHR_RENDER_MODE
+#define DHR_RENDER_MODE DHR_COLOR_140
+#endif
+
+#if DHR_RENDER_MODE < DHR_COLOR_140 || DHR_RENDER_MODE > DHR_MONO_PAIR_XOR
+#error "DHR_RENDER_MODE must select one of the defined DHR diagnostic modes"
 #endif
 
 #if ESPAPPLEII_RELEASE

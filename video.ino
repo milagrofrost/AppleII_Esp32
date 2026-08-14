@@ -122,22 +122,24 @@ static const uint8_t dhgrToAppleColor[16] = {
   0x9, 0xB, 0xD, 0xF
 };
 
-static_assert(APPLE_OUTPUT_X + (APPLE_SOURCE_WIDTH - 1) * APPLE_SCALE + APPLE_SCALE - 1 == 599,
-              "Apple output right edge must be x=599");
-static_assert(APPLE_OUTPUT_Y + (APPLE_SOURCE_HEIGHT - 1) * APPLE_SCALE + APPLE_SCALE - 1 == 431,
-              "Apple output bottom edge must be y=431");
+static_assert(APPLE_OUTPUT_X + APPLE_SOURCE_WIDTH - 1 == 299,
+              "Apple output right edge must be x=299");
+static_assert(APPLE_OUTPUT_Y + APPLE_SOURCE_HEIGHT - 1 == 195,
+              "Apple output bottom edge must be y=195");
+static_assert(APPLE_SCALE == 1, "Apple output must use native 1x scaling");
+static_assert(APPLE_OUTPUT_WIDTH == APPLE_SOURCE_WIDTH,
+              "Apple output width must match its 280-pixel source");
+static_assert(APPLE_OUTPUT_HEIGHT == APPLE_SOURCE_HEIGHT,
+              "Apple output height must match its 192-line source");
 
-// Exact 2x expansion using physical framebuffer coordinates. Canvas origin
-// remains (0,0) for Apple video and host UI alike.
+// Exact native 1x rendering using physical framebuffer coordinates. Canvas
+// origin remains (0,0) for Apple video and host UI alike.
 static inline void SetApplePixel(int x, int y, Color color) {
 	if ((unsigned) x >= APPLE_SOURCE_WIDTH || (unsigned) y >= APPLE_SOURCE_HEIGHT)
 		return;
-	int scaledX = APPLE_OUTPUT_X + x * APPLE_SCALE;
-	int scaledY = APPLE_OUTPUT_Y + y * APPLE_SCALE;
-	canvas.setPixel(scaledX,     scaledY,     color);
-	canvas.setPixel(scaledX + 1, scaledY,     color);
-	canvas.setPixel(scaledX,     scaledY + 1, color);
-	canvas.setPixel(scaledX + 1, scaledY + 1, color);
+	int dstX = APPLE_OUTPUT_X + x;
+	int dstY = APPLE_OUTPUT_Y + y;
+	canvas.setPixel(dstX, dstY, color);
 }
 
 /***************************************************************************************************************************************/
@@ -321,9 +323,31 @@ void virtline(unsigned int rastline)
 								dots[dot++] = (pair[bank] >> bitIndex) & 1;
 					}
 
-					// Four consecutive 560-dot bits form one of the 140 stable DHR
-					// color cells. Keep those groups fixed at the color-burst phase;
-					// overlapping windows produce false cyan/magenta/yellow fringes.
+				#if DHR_RENDER_MODE != DHR_COLOR_140
+					// The 320x200 FabGL canvas cannot display 560 independent
+					// horizontal dots. Preserve the canonical stream through this
+					// point, then apply the selected two-dot monochrome reduction.
+					for (int pixel = 0; pixel < 280; pixel++) {
+						int sourceDot = pixel * 2;
+						bool evenDot = dots[sourceDot];
+						bool oddDot = dots[sourceDot + 1];
+					#if DHR_RENDER_MODE == DHR_MONO_PAIR_AND
+						bool on = evenDot && oddDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_EVEN
+						bool on = evenDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_ODD
+						bool on = oddDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_PAIR_XOR
+						bool on = evenDot != oddDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_PAIR_OR
+						bool on = evenDot || oddDot;
+					#endif
+						SetApplePixel(pixel, rastline * 8 + line,
+						              on ? (Color) 15 : (Color) 0);
+					}
+				#else
+					// Existing 140-cell color decode: four consecutive source dots
+					// select one Apple II color, expanded across two output pixels.
 					for (int colorPixel = 0; colorPixel < 140; colorPixel++) {
 						int sourceDot = colorPixel * 4;
 						unsigned char colorIndex = dots[sourceDot]
@@ -334,6 +358,7 @@ void virtline(unsigned int rastline)
 						SetApplePixel(colorPixel * 2, rastline * 8 + line, color);
 						SetApplePixel(colorPixel * 2 + 1, rastline * 8 + line, color);
 					}
+				#endif
 				}
 				return;
 			}
@@ -467,7 +492,19 @@ void CheckVideoIO(word Address) {
         if (!iieDoubleHires) {
           iieDoubleHires = true;
           InvalidateVideoCaches();
-          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E)");
+#if DHR_RENDER_MODE == DHR_COLOR_140
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=color-140");
+#elif DHR_RENDER_MODE == DHR_MONO_PAIR_AND
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-and");
+#elif DHR_RENDER_MODE == DHR_MONO_EVEN
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-even-dots");
+#elif DHR_RENDER_MODE == DHR_MONO_ODD
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-odd-dots");
+#elif DHR_RENDER_MODE == DHR_MONO_PAIR_XOR
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-xor");
+#elif DHR_RENDER_MODE == DHR_MONO_PAIR_OR
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-or");
+#endif
         }
       }
       return;
