@@ -113,6 +113,7 @@ unsigned short value16, value16_2, result;
 #if ENABLE_CPU_TRACE
 static unsigned int brkTraceCount = 0;
 static unsigned int cmosUnhandledTraceCount = 0;
+static unsigned int nmosCMOSOpcodeTraceCount = 0;
 #endif
 
 static bool IsHandledCMOSOpcode(unsigned char op) {
@@ -292,13 +293,26 @@ void execCode() {
       case AD_IMM:
         argument_addr = PC++;
         break;
-      case AD_IND:
+      case AD_IND: {
         argument_addr = read16(PC);
+        unsigned short indirectPointer = argument_addr;
         value16 = Is65C02Mode() ? argument_addr + 1
                                 : (argument_addr&0xFF00) | ((argument_addr+1)&0x00FF);
         argument_addr = (unsigned short)read8(argument_addr) | ((unsigned short)read8(value16) << 8);
+#if ENABLE_CPU_TRACE
+        static unsigned char zeroIndirectTraceCount = 0;
+        if ((argument_addr == 0 || read8(argument_addr) == 0x00) &&
+            zeroIndirectTraceCount < 8) {
+          DEBUG_PRINTF("[CPU] suspicious indirect target opcode=%02X at=%04X pointer=%04X target=%04X first=%02X\n",
+                       opcode, (unsigned short) (PC - 1), indirectPointer,
+                       argument_addr, read8(argument_addr));
+          PrintIIeMemoryDiagnostic(indirectPointer);
+          zeroIndirectTraceCount++;
+        }
+#endif
         PC+=2;
         break;
+      }
       case AD_INDX:
         argument_addr = ((unsigned short)read8(PC++) + (unsigned short)X)&0xFF;
         value16 = (argument_addr&0xFF00) | ((argument_addr+1)&0x00FF); // Page wrap
@@ -351,6 +365,22 @@ void execCode() {
             instructionCycles++;
             break;
         }
+      }
+
+      // CMOS-only opcodes must never reach the 65C02 handlers while running
+      // either NMOS profile. Previously an undefined NMOS $80 executed BRA
+      // with a stale argument address and jumped into arbitrary memory.
+      if (!Is65C02Mode() && baseOpcodeUndefined) {
+#if ENABLE_CPU_TRACE
+        if (IsHandledCMOSOpcode(opcode) && nmosCMOSOpcodeTraceCount < 16) {
+          DEBUG_PRINTF("[CPU] NMOS ignored 65C02 opcode=%02X at=%04X\n",
+                       opcode, CPUInstructionStartPC);
+          nmosCMOSOpcodeTraceCount++;
+        }
+#endif
+        cycle += instructionCycles;
+        TotalCycles += instructionCycles;
+        return;
       }
 
       //opcodes

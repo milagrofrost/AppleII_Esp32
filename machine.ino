@@ -77,5 +77,15 @@ bool InitializeMachineProfiles() {
     }
     fclose(rom);
   }
+
+  // Prefer the most capable IIe profile at startup. The disk selector still
+  // cycles through every available profile, including Apple II+ 64K.
+  if (EnhancedIIeROMAvailable)
+    SetMachineProfile(APPLE_IIE_ENHANCED_128K);
+  else if (IIeROMAvailable)
+    SetMachineProfile(APPLE_IIE_128K);
+  else
+    SetMachineProfile(APPLE_II_PLUS_64K);
+
   return IIeROMAvailable || EnhancedIIeROMAvailable;
 }

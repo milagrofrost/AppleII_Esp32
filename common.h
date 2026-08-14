@@ -67,6 +67,7 @@ extern bool iieDoubleHires;
 unsigned char HostPaddleValue(int paddle);
 bool HostJoystickButton(int button);
 void PrintDiskRuntimeState();
+void PrintIIeMemoryDiagnostic(unsigned short address);
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();

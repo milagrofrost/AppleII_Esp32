@@ -36,6 +36,7 @@
 
 #include "Timer.h"                    // https://github.com/JChristensen/Timer
 #include "fabgl.h"
+#include "esp_system.h"
 #include "common.h"
 
 fabgl::PS2Controller    PS2Controller;          // PS/2 keyboard controller
@@ -403,6 +404,17 @@ void Task2code( void * pvParameters ){
       DEBUG_PRINTF("[TASK] Video minimum free stack=%u bytes\n",
                    (unsigned) uxTaskGetStackHighWaterMark(NULL));
       uint32_t currentCPUHeartbeat = CPUInstructionHeartbeat;
+      if (currentCPUHeartbeat < lastCPUHeartbeat &&
+          !(lastCPUHeartbeat > 0xF0000000UL && currentCPUHeartbeat < 0x0FFFFFFFUL)) {
+        DEBUG_PRINTF("[TASK] CPU HEARTBEAT REGRESSION previous=%lu current=%lu taskState=%d stage=%u PC=%04X opcode=%02X SP=%02X cycles=%llu freeHeap=%u maxAlloc=%u resetReason=%d\n",
+                     (unsigned long) lastCPUHeartbeat,
+                     (unsigned long) currentCPUHeartbeat,
+                     Task1 ? (int) eTaskGetState(Task1) : -1,
+                     (unsigned) CPUExecutionStage, CPUInstructionStartPC,
+                     CPUInstructionOpcode, STP, TotalCycles,
+                     ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                     (int) esp_reset_reason());
+      }
       if (currentCPUHeartbeat == lastCPUHeartbeat) {
         DEBUG_PRINTF("[TASK] CPU STALLED taskState=%d stage=%u PC=%04X opcode=%02X cycle=%lu\n",
                      Task1 ? (int) eTaskGetState(Task1) : -1,
@@ -429,6 +441,8 @@ void setup()
 #endif
   
   DEBUG_PRINTLN( "EspApple II Emulator (ESP32) ");
+  DEBUG_PRINTF("[BOOT] resetReason=%d freeHeap=%u maxAlloc=%u\n",
+               (int) esp_reset_reason(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // Disable the watchdog on both cores
   disableCore0WDT();

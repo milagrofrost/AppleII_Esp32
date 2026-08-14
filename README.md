@@ -142,7 +142,7 @@ The emulator keeps the Apple II+ 64K profile for older software and can also run
 /apple2/roms/apple2e.rom
 ```
 
-At the disk selector, press **Tab** to cycle through `APPLE II+ 64K`, `APPLE IIE 128K`, and `ENHANCED IIE 128K`, then choose the disk with **Enter**. Missing profiles are skipped. The selected machine profile is preserved when reopening the disk selector with **Ctrl+Alt+Delete**.
+Startup prefers `ENHANCED IIE 128K` when its ROM is available, then `APPLE IIE 128K`, and falls back to `APPLE II+ 64K` when neither IIe ROM is present. At the disk selector, press **Tab** to cycle through `APPLE II+ 64K`, `APPLE IIE 128K`, and `ENHANCED IIE 128K`, then choose the disk with **Enter**. Missing IIe profiles are skipped, while Apple II+ 64K remains selectable for older software. The selected machine profile is preserved when reopening the disk selector with **Ctrl+Alt+Delete**.
 
 IIe mode implements the 64K auxiliary bank, `80STORE`, `RAMRD`, `RAMWRT`, `ALTZP`, internal-ROM selection, 80-column text, double low resolution, and double high resolution. The Enhanced profile adds the 65C02 CPU and loads `/apple2/roms/apple2e-enhanced.rom`; the original profile retains the NMOS 6502 and `/apple2/roms/apple2e.rom`. Each ROM must be exactly 16,384 bytes.
 

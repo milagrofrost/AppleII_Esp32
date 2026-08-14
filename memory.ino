@@ -879,6 +879,40 @@ static unsigned char IIeStatus(bool enabled) {
   return (enabled ? 0x80 : 0x00) | (k & 0x7f);
 }
 
+void PrintIIeMemoryDiagnostic(unsigned short address) {
+#if ENABLE_CPU_TRACE
+  unsigned char visibleLow = read8(address);
+  unsigned char visibleHigh = read8(address + 1);
+  unsigned char mainLow = 0, mainHigh = 0, auxLow = 0, auxHigh = 0;
+  if (address < 0xBFFF) {
+    mainLow = RAM[address];
+    mainHigh = RAM[address + 1];
+    if (AUXRAM) {
+      auxLow = AUXRAM[address];
+      auxHigh = AUXRAM[address + 1];
+    }
+  } else if (address >= 0xD000 && address < 0xFFFF) {
+    unsigned int lowIndex = LanguageCardIndex(address);
+    unsigned int highIndex = LanguageCardIndex(address + 1);
+    mainLow = RAMEXT[lowIndex];
+    mainHigh = RAMEXT[highIndex];
+    if (AUXRAMEXT) {
+      auxLow = AUXRAMEXT[lowIndex];
+      auxHigh = AUXRAMEXT[highIndex];
+    }
+  }
+  DEBUG_PRINTF("[CPU-MEM] pointer=%04X visible=%02X%02X main=%02X%02X aux=%02X%02X LCRAMR=%u LCRAMW=%u LCBANK2=%u RAMRD=%u RAMWRT=%u ALTZP=%u 80STORE=%u PAGE2=%u HIRES=%u\n",
+               address, visibleHigh, visibleLow, mainHigh, mainLow,
+               auxHigh, auxLow, (unsigned) (memlcramr != 0),
+               (unsigned) (memlcramw != 0), (unsigned) (memlcbank2 != 0),
+               (unsigned) iieRamReadAux, (unsigned) iieRamWriteAux,
+               (unsigned) iieAltZeroPage, (unsigned) iie80Store,
+               (unsigned) ((gm & PG2) != 0), (unsigned) ((gm & HRG) != 0));
+#else
+  (void) address;
+#endif
+}
+
 static void SetIIeSwitch(unsigned short address) {
   if (!IsIIeMode())
     return;
