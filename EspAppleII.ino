@@ -26,15 +26,9 @@
 #define SHOWTASKCORE
 #endif
 
-// Video mode (define only one)
-#define VIDEO_400X300_OVER_640X480  // 400x300 canvas inside standard 640x480 VGA
-//#define VGA_320x200_70Hz      // Smaller screen
+// Hardware-confirmed native VGA16 framebuffer mode.
+#define VGA_320x200_70Hz
 
-// Safe-area inset inside the framebuffer. Some VGA televisions auto-center
-// porch changes, so moving the rendered canvas is more reliable than changing
-// sync timing. This translates pixels only and does not scale the 4:3 output.
-#define VGA_CANVAS_OFFSET_X 0
-#define VGA_CANVAS_OFFSET_Y 0
 #define VGA_ALIGNMENT_MARKERS 0
 
 // SD-backed boot disk support
@@ -48,13 +42,46 @@ fabgl::PS2Controller    PS2Controller;          // PS/2 keyboard controller
 fabgl::VGA16Controller  VGAController;          // VGA video controller
 fabgl::Canvas           canvas(&VGAController);
 
+static const fabgl::RGB888 appleIIPalette[16] = {
+  {  0,   0,   0}, {170,   0,  85}, {  0,   0, 170}, {170,   0, 255},
+  {  0,  85,   0}, { 85,  85,  85}, {  0, 170, 255}, {170, 170, 255},
+  { 85,  85,   0}, {255,  85,   0}, {170, 170, 170}, {255, 170, 255},
+  { 85, 255,   0}, {255, 255,   0}, { 85, 255, 170}, {255, 255, 255}
+};
+
+static void ConfigureAppleIIPalette() {
+  for (int index = 0; index < 16; index++)
+    VGAController.setPaletteItem(index, appleIIPalette[index]);
+}
+
+#if ENABLE_VGA_PALETTE_TEST
+static void DrawVGAPaletteTest() {
+  canvas.setOrigin(0, 0);
+  int width = canvas.getWidth();
+  int height = canvas.getHeight();
+  int cellWidth = width / 4;
+  int cellHeight = height / 4;
+  for (int index = 0; index < 16; index++) {
+    int left = (index & 3) * cellWidth;
+    int top = (index >> 2) * cellHeight;
+    int right = (index & 3) == 3 ? width - 1 : left + cellWidth - 1;
+    int bottom = (index >> 2) == 3 ? height - 1 : top + cellHeight - 1;
+    canvas.setBrushColor((Color) index);
+    canvas.fillRectangle(left, top, right, bottom);
+    canvas.setPenColor(index == 0 || index == 2 || index == 4 || index == 5 || index == 8
+                       ? (Color) 15 : (Color) 0);
+    char label[2] = { index < 10 ? (char) ('0' + index) : (char) ('A' + index - 10), '\0' };
+    canvas.drawText(left + 8, top + 8, label);
+  }
+}
+#endif
+
 void DrawVGAAlignmentMarkers() {
 #if VGA_ALIGNMENT_MARKERS
   // Some televisions auto-position VGA from the bounding box of non-black
   // pixels. Anchor all four edges so later Apple II content cannot cause the
   // television to reinterpret the left edge. Work in physical canvas
   // coordinates, independently of the Apple II safe-area origin.
-  fabgl::Point savedOrigin = canvas.getOrigin();
   canvas.setOrigin(0, 0);
   int right = canvas.getWidth() - 1;
   int bottom = canvas.getHeight() - 1;
@@ -62,7 +89,6 @@ void DrawVGAAlignmentMarkers() {
   canvas.setPixel(right, 0, Color::BrightWhite);
   canvas.setPixel(0, bottom, Color::BrightWhite);
   canvas.setPixel(right, bottom, Color::BrightWhite);
-  canvas.setOrigin(savedOrigin);
 #endif
 }
 
@@ -91,6 +117,8 @@ TaskHandle_t Task2;
 /* virtual screen buffer */
 unsigned char RAM[0xC000];
 unsigned char RAMEXT[0x4000];
+unsigned char * AUXRAM = NULL;
+unsigned char * AUXRAMEXT = NULL;
 unsigned char RAM_TXT_BACK[0x400];
 unsigned char RAM_HGR_BACK[0x2000];
 
@@ -171,17 +199,50 @@ void initTasks() {
 uint64_t EmulationTimingBaseCycles = 0;
 uint64_t EmulationTimingBaseMicros = 0;
 bool EmulationTimingReady = false;
+volatile uint32_t CPUInstructionHeartbeat = 0;
+volatile unsigned short CPUInstructionStartPC = 0;
+volatile unsigned char CPUInstructionOpcode = 0xFF;
+volatile unsigned char CPUExecutionStage = 0;
+unsigned short CPURecentPC[16] = { 0 };
+unsigned char CPURecentOpcode[16] = { 0 };
+unsigned short CPURecentArgument[16] = { 0 };
+unsigned char CPURecentIndex = 0;
+
+static bool EmulationTargetMicros(uint64_t nowMicros, uint64_t * targetMicros) {
+  uint64_t total = TotalCycles;
+  uint64_t baseCycles = EmulationTimingBaseCycles;
+  uint64_t baseMicros = EmulationTimingBaseMicros;
+  if (total < baseCycles || nowMicros < baseMicros) {
+    EmulationTimingBaseCycles = total;
+    EmulationTimingBaseMicros = nowMicros;
+    *targetMicros = nowMicros;
+    return false;
+  }
+
+  uint64_t elapsedCycles = total - baseCycles;
+  // Rebase periodically. Besides keeping the math compact, this ensures a
+  // damaged timestamp cannot turn speaker or CPU pacing into a huge delay.
+  if (elapsedCycles > 10230000ULL) {
+    EmulationTimingBaseCycles = total;
+    EmulationTimingBaseMicros = nowMicros;
+    *targetMicros = nowMicros;
+    return false;
+  }
+  *targetMicros = baseMicros + (elapsedCycles * 1000000ULL) / 1023000ULL;
+  return true;
+}
 
 void PaceSpeakerToEmulatedCycle() {
   if (!EmulationTimingReady)
     return;
 
-  const uint64_t appleClockHz = 1023000ULL;
-  uint64_t targetMicros = EmulationTimingBaseMicros
-    + ((TotalCycles - EmulationTimingBaseCycles) * 1000000ULL) / appleClockHz;
   uint64_t nowMicros = esp_timer_get_time();
-  if (targetMicros > nowMicros)
-    delayMicroseconds((unsigned int) (targetMicros - nowMicros));
+  uint64_t targetMicros;
+  if (EmulationTargetMicros(nowMicros, &targetMicros) && targetMicros > nowMicros) {
+    uint64_t waitMicros = targetMicros - nowMicros;
+    if (waitMicros <= 20000ULL)
+      delayMicroseconds((unsigned int) waitMicros);
+  }
 }
 
 void Task1code( void * pvParameters ){
@@ -204,11 +265,22 @@ void Task1code( void * pvParameters ){
   uint64_t nextPacingCycle = TotalCycles + pacingIntervalCycles;
 #if ENABLE_STACK_TELEMETRY
   unsigned long nextStackReport = millis() + 10000;
+  uint32_t previousReportHeartbeat = CPUInstructionHeartbeat;
+  unsigned short previousReportPC = PC;
 #endif
   
   // Loop Task1
   for(;;) {
+    CPUInstructionStartPC = PC;
+    CPUInstructionOpcode = 0xFF;
+    CPUExecutionStage = 1; // fetching/executing a 6502 instruction
     execCode();
+    CPURecentPC[CPURecentIndex] = CPUInstructionStartPC;
+    CPURecentOpcode[CPURecentIndex] = CPUInstructionOpcode;
+    CPURecentArgument[CPURecentIndex] = argument_addr;
+    CPURecentIndex = (CPURecentIndex + 1) & 0x0F;
+    CPUExecutionStage = 0;
+    CPUInstructionHeartbeat++;
 #if ENABLE_CPU_TRACE
     instructionCount++;
     if (tracesRemaining && instructionCount == nextTrace) {
@@ -239,8 +311,28 @@ void Task1code( void * pvParameters ){
 
 #if ENABLE_STACK_TELEMETRY
     if ((long) (millis() - nextStackReport) >= 0) {
-      DEBUG_PRINTF("[TASK] CPU minimum free stack=%u bytes\n",
+      uint32_t heartbeat = CPUInstructionHeartbeat;
+      uint32_t instructionDelta = heartbeat - previousReportHeartbeat;
+      DEBUG_PRINTF("[CPU-LIVE] heartbeat=%lu delta=%lu PC=%04X opcode=%02X A=%02X X=%02X Y=%02X SP=%02X SR=%02X stack=%u",
+                   (unsigned long) heartbeat, (unsigned long) instructionDelta,
+                   CPUInstructionStartPC, CPUInstructionOpcode,
+                   A, X, Y, STP, SR,
                    (unsigned) uxTaskGetStackHighWaterMark(NULL));
+      PrintDiskRuntimeState();
+      DEBUG_PRINTF(" joy=%u,%u button=%u\n",
+                   (unsigned) HostPaddleValue(0), (unsigned) HostPaddleValue(1),
+                   (unsigned) HostJoystickButton(0));
+      if (instructionDelta && CPUInstructionStartPC == previousReportPC) {
+        DEBUG_PRINT("[CPU-LIVE] repeating-PC history:");
+        for (int historyOffset = 0; historyOffset < 16; historyOffset++) {
+          unsigned char historyIndex = (CPURecentIndex + historyOffset) & 0x0F;
+          DEBUG_PRINTF(" %04X:%02X@%04X", CPURecentPC[historyIndex],
+                       CPURecentOpcode[historyIndex], CPURecentArgument[historyIndex]);
+        }
+        DEBUG_PRINTLN();
+      }
+      previousReportHeartbeat = heartbeat;
+      previousReportPC = CPUInstructionStartPC;
       nextStackReport += 10000;
     }
 #endif
@@ -248,16 +340,23 @@ void Task1code( void * pvParameters ){
     // Pace the emulated machine from accumulated 6502 cycles. This gives the
     // CPU, speaker soft switch, video changes, and Disk II one shared clock.
     if (TotalCycles >= nextPacingCycle) {
-      uint64_t targetMicros = EmulationTimingBaseMicros
-        + ((TotalCycles - EmulationTimingBaseCycles) * 1000000ULL) / appleClockHz;
       uint64_t nowMicros = esp_timer_get_time();
-      if (targetMicros > nowMicros) {
+      uint64_t targetMicros;
+      bool targetValid = EmulationTargetMicros(nowMicros, &targetMicros);
+      if (targetValid && targetMicros > nowMicros) {
         uint64_t waitMicros = targetMicros - nowMicros;
-        if (waitMicros > 1000ULL)
+        if (waitMicros > 20000ULL) {
+          // A normal pacing correction is at most about one 1024-cycle slice.
+          // Never let corrupt/stale timing arithmetic park the CPU task for an
+          // observable length of time.
+          DEBUG_PRINTF("[CPU] pacing anomaly=%lluus; clock rebased\n", waitMicros);
+          EmulationTimingBaseCycles = TotalCycles;
+          EmulationTimingBaseMicros = nowMicros;
+        } else if (waitMicros > 1000ULL)
           delay((unsigned long) (waitMicros / 1000ULL));
         else
           delayMicroseconds((unsigned int) waitMicros);
-      } else if (nowMicros - targetMicros > 250000ULL) {
+      } else if (targetValid && nowMicros - targetMicros > 250000ULL) {
         // Serial output or a slow host-side operation can stall this task.
         // Rebase instead of trying to run above Apple II speed to catch up.
         EmulationTimingBaseCycles = TotalCycles;
@@ -280,6 +379,7 @@ void Task2code( void * pvParameters ){
 
 #if ENABLE_STACK_TELEMETRY
   unsigned long nextStackReport = millis() + 10000;
+  uint32_t lastCPUHeartbeat = CPUInstructionHeartbeat;
 #endif
 
   // Loop Task2
@@ -302,6 +402,14 @@ void Task2code( void * pvParameters ){
     if ((long) (millis() - nextStackReport) >= 0) {
       DEBUG_PRINTF("[TASK] Video minimum free stack=%u bytes\n",
                    (unsigned) uxTaskGetStackHighWaterMark(NULL));
+      uint32_t currentCPUHeartbeat = CPUInstructionHeartbeat;
+      if (currentCPUHeartbeat == lastCPUHeartbeat) {
+        DEBUG_PRINTF("[TASK] CPU STALLED taskState=%d stage=%u PC=%04X opcode=%02X cycle=%lu\n",
+                     Task1 ? (int) eTaskGetState(Task1) : -1,
+                     (unsigned) CPUExecutionStage, CPUInstructionStartPC,
+                     CPUInstructionOpcode, cycle);
+      }
+      lastCPUHeartbeat = currentCPUHeartbeat;
       nextStackReport += 10000;
     }
 #endif
@@ -330,15 +438,24 @@ void setup()
   VGAController.queueSize = 256;  // trade UI speed using less RAM and allow both WiFi
   VGAController.begin();
   
-  #ifdef VIDEO_400X300_OVER_640X480
-  // Use standard 640x480 sync/timing for television compatibility, while
-  // retaining the existing centered 400x300 framebuffer. Both are 4:3.
-  VGAController.setResolution(VGA_640x480_60Hz, 400, 300);
-  #endif
-
   #ifdef VGA_320x200_70Hz
   VGAController.setResolution(VGA_320x200_70Hz);
   #endif
+
+  canvas.setOrigin(0, 0);
+  fabgl::Point physicalOrigin = canvas.getOrigin();
+  DEBUG_PRINTF("[VIDEO] canvas=%dx%d origin=%d,%d screen=%dx%d freeHeap=%u maxAlloc=%u\n",
+               canvas.getWidth(), canvas.getHeight(), physicalOrigin.X, physicalOrigin.Y,
+               VGAController.getScreenWidth(), VGAController.getScreenHeight(), ESP.getFreeHeap(),
+               ESP.getMaxAllocHeap());
+  if (canvas.getWidth() != 320 || canvas.getHeight() != 200) {
+    DEBUG_PRINTF("[VIDEO] WARNING framebuffer mismatch requested=320x200 actual=%dx%d\n",
+                 canvas.getWidth(), canvas.getHeight());
+  }
+
+  // FabGL restores its default VGA16 palette in setResolution(), so install
+  // the Apple II palette only after the selected resolution is active.
+  ConfigureAppleIIPalette();
 
   // this speed-up display but may generate flickering
 	VGAController.enableBackgroundPrimitiveExecution(false);
@@ -346,17 +463,20 @@ void setup()
 
   canvas.setBrushColor(Color::Black);
   canvas.clear();
-  canvas.setOrigin(VGA_CANVAS_OFFSET_X, VGA_CANVAS_OFFSET_Y);
+  canvas.setOrigin(0, 0);
   DrawVGAAlignmentMarkers();
-  DEBUG_PRINTF("[VIDEO] canvas inset x=%d y=%d, signal=%dx%d canvas=%dx%d\n",
-               VGA_CANVAS_OFFSET_X, VGA_CANVAS_OFFSET_Y,
-               VGAController.getScreenWidth(), VGAController.getScreenHeight(),
-               canvas.getWidth(), canvas.getHeight());
 
   canvas.selectFont(&fabgl::FONT_8x8);
  
   canvas.setGlyphOptions(GlyphOptions().FillBackground(true));
-  
+
+#if ENABLE_VGA_PALETTE_TEST
+  DrawVGAPaletteTest();
+  DEBUG_PRINTLN("[VIDEO] raw VGA16 Apple II palette test active");
+  for (;;)
+    delay(1000);
+#endif
+
   // Initialize the PS/2 keyboard
   PS2Controller.begin(PS2Preset::KeyboardPort0, KbdMode::NoVirtualKeys);
 

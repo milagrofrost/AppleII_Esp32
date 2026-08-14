@@ -20,6 +20,15 @@
 
 #include "build_config.h"
 
+#define APPLE_SOURCE_WIDTH  280
+#define APPLE_SOURCE_HEIGHT 192
+#define APPLE_SCALE         1
+#define APPLE_OUTPUT_WIDTH  280
+#define APPLE_OUTPUT_HEIGHT 192
+#define APPLE_OUTPUT_X      20
+#define APPLE_OUTPUT_Y      4
+#include "machine.h"
+
 #if ENABLE_SERIAL_DEBUG
   #define DEBUG_PRINTF(x,...) Serial.printf(x, ##__VA_ARGS__)
   #define DEBUG_PRINT(x,...) Serial.print(x, ##__VA_ARGS__)
@@ -41,12 +50,23 @@ extern uint64_t TotalCycles;
 extern uint64_t EmulationTimingBaseCycles;
 extern uint64_t EmulationTimingBaseMicros;
 extern bool EmulationTimingReady;
+extern unsigned short CPURecentPC[16];
+extern unsigned char CPURecentOpcode[16];
+extern unsigned short CPURecentArgument[16];
+extern unsigned char CPURecentIndex;
 void PaceSpeakerToEmulatedCycle();
 
 // CPU entry points required by the runtime task.
 void initCode();
 void execCode();
 void ResetMemorySoftSwitches();
+void InvalidateVideoCaches();
+extern bool iie80Column;
+extern bool iieAltCharset;
+extern bool iieDoubleHires;
+unsigned char HostPaddleValue(int paddle);
+bool HostJoystickButton(int button);
+void PrintDiskRuntimeState();
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();

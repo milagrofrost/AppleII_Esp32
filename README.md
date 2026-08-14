@@ -112,15 +112,19 @@ Format the card as FAT32 and use this layout:
 ```text
 SD card root/
 └── apple2/
-    ├── dos33.dsk
+    ├── roms/
+    │   ├── apple2e.rom
+    │   └── apple2e-enhanced.rom
     └── disks/
+        ├── apple2-index.txt
+        ├── dos33.dsk
         ├── choplifter.dsk
         ├── galaxian.dsk
         ├── rescue-raiders.dsk
         └── another-game.dsk
 ```
 
-`/apple2/dos33.dsk` is the default and backward-compatible boot image. Additional images belong in `/apple2/disks/`, which may contain subdirectories.
+Disk images belong in `/apple2/disks/`, which may contain subdirectories. Only images listed in `/apple2/disks/apple2-index.txt` appear in the selector.
 
 For the current milestone, every image must be:
 
@@ -130,13 +134,27 @@ For the current milestone, every image must be:
 
 Images with other sizes are skipped and reported over serial. Formats such as `.po`, `.nib`, `.woz`, and 2MG are not currently supported.
 
-For a large archive, generate the index on the computer before copying the archive to the SD card:
+## Apple IIe 128K mode
+
+The emulator keeps the Apple II+ 64K profile for older software and can also run as a 6502-based Apple IIe with 128K. Apple ROM code is not distributed with this repository. To enable the IIe profile, provide a legally obtained, unmodified 16K Apple IIe ROM image at:
+
+```text
+/apple2/roms/apple2e.rom
+```
+
+At the disk selector, press **Tab** to cycle through `APPLE II+ 64K`, `APPLE IIE 128K`, and `ENHANCED IIE 128K`, then choose the disk with **Enter**. Missing profiles are skipped. The selected machine profile is preserved when reopening the disk selector with **Ctrl+Alt+Delete**.
+
+IIe mode implements the 64K auxiliary bank, `80STORE`, `RAMRD`, `RAMWRT`, `ALTZP`, internal-ROM selection, 80-column text, double low resolution, and double high resolution. The Enhanced profile adds the 65C02 CPU and loads `/apple2/roms/apple2e-enhanced.rom`; the original profile retains the NMOS 6502 and `/apple2/roms/apple2e.rom`. Each ROM must be exactly 16,384 bytes.
+
+Arrow keys emulate the two analog joystick axes and **Space** is joystick button 0. This supports software such as Test Drive that reads the Apple game-port paddle timers.
+
+Generate the required index on the computer before copying the archive to the SD card:
 
 ```bash
 python3 tools/build_disk_index.py "/path/to/apple2/disks"
 ```
 
-This creates `apple2-index.txt` inside that directory. Copy the complete `apple2` tree to the SD card. The firmware loads this index directly; if it is absent or invalid, it falls back to recursively scanning the directory.
+This creates `apple2-index.txt` inside that directory. Copy the complete `apple2` tree to the SD card. The firmware never scans the disk directory at startup: an image not present in the index is not listed, and a missing or invalid index stops boot with an SD disk error.
 
 The firmware stores compact catalog records and a shared path-string pool in PSRAM. Up to 4,096 indexed images are supported.
 
@@ -179,7 +197,9 @@ With PSRAM, the selector supports up to 4,096 images. Without PSRAM it retains a
 
 Press **Ctrl+Alt+Delete** while emulation is running to reopen the disk selector and cold-boot the newly selected drive-1 image.
 
-If only `/apple2/dos33.dsk` is present, it boots immediately without showing the selector.
+Press **Ctrl+Alt+S** to replace the disk in drive 1 without resetting the emulated machine. Use this when software asks for another disk side: select the requested side, press **Enter**, then press the key or joystick button requested by the software. RAM, CPU registers, video mode, and the active machine profile are preserved during the swap.
+
+The selector is shown even for a one-entry index so the machine profile can still be changed with **Tab**.
 
 ## Serial diagnostics
 

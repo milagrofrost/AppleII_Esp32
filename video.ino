@@ -23,14 +23,14 @@
 #include "font.h"
 
 int gm;
-static  Color COL_HGR0  = Color::Black;
-static  Color COL_HGR1  = Color::BrightGreen;
-static  Color COL_HGR2  = Color::BrightMagenta;
-static  Color COL_HGR3  = Color::BrightWhite;
-static  Color COL_HGR4  = Color::Black;
-static  Color COL_HGR5  = Color::BrightYellow;
-static  Color COL_HGR6  = Color::BrightBlue;
-static  Color COL_HGR7  = Color::BrightWhite;
+static  Color COL_HGR0  = (Color) 0;   // black
+static  Color COL_HGR1  = (Color) 12;  // green
+static  Color COL_HGR2  = (Color) 3;   // violet
+static  Color COL_HGR3  = (Color) 15;  // white
+static  Color COL_HGR4  = (Color) 0;   // black
+static  Color COL_HGR5  = (Color) 9;   // orange
+static  Color COL_HGR6  = (Color) 6;   // blue
+static  Color COL_HGR7  = (Color) 15;  // white
 
 /* even columns */
 static Color colourtabe[8]  = {COL_HGR0, COL_HGR0, COL_HGR2, COL_HGR3, COL_HGR0, COL_HGR1, COL_HGR3, COL_HGR3};
@@ -98,15 +98,49 @@ static unsigned char cachedFlashChar = 0;
 static unsigned short cachedLoresPage = 0;
 static bool loresCacheValid = false;
 
+void InvalidateVideoCaches() {
+  textCacheValid = false;
+  loresCacheValid = false;
+  hiresCacheValid = false;
+}
+
 // The Apple II lo-res values are composite-video colors. VGA16 cannot
 // reproduce every shade exactly, but this preserves their color families and
 // is far closer than treating every non-black value as white.
 static Color const loresPalette[16] = {
-  Color::Black,         Color::Magenta,       Color::Blue,          Color::BrightMagenta,
-  Color::Green,         Color::White,         Color::Cyan,          Color::BrightBlue,
-  Color::Yellow,        Color::BrightRed,     Color::BrightBlack,   Color::BrightMagenta,
-  Color::BrightGreen,   Color::BrightYellow,  Color::BrightCyan,    Color::BrightWhite
+  (Color) 0,  (Color) 1,  (Color) 2,  (Color) 3,
+  (Color) 4,  (Color) 5,  (Color) 6,  (Color) 7,
+  (Color) 8,  (Color) 9,  (Color) 10, (Color) 11,
+  (Color) 12, (Color) 13, (Color) 14, (Color) 15
 };
+
+// AppleWin/EspAppleII DHR bit-pattern to Apple II color-number permutation.
+static const uint8_t dhgrToAppleColor[16] = {
+  0x0, 0x2, 0x4, 0x6,
+  0x8, 0xA, 0xC, 0xE,
+  0x1, 0x3, 0x5, 0x7,
+  0x9, 0xB, 0xD, 0xF
+};
+
+static_assert(APPLE_OUTPUT_X + APPLE_SOURCE_WIDTH - 1 == 299,
+              "Apple output right edge must be x=299");
+static_assert(APPLE_OUTPUT_Y + APPLE_SOURCE_HEIGHT - 1 == 195,
+              "Apple output bottom edge must be y=195");
+static_assert(APPLE_SCALE == 1, "Apple output must use native 1x scaling");
+static_assert(APPLE_OUTPUT_WIDTH == APPLE_SOURCE_WIDTH,
+              "Apple output width must match its 280-pixel source");
+static_assert(APPLE_OUTPUT_HEIGHT == APPLE_SOURCE_HEIGHT,
+              "Apple output height must match its 192-line source");
+
+// Exact native 1x rendering using physical framebuffer coordinates. Canvas
+// origin remains (0,0) for Apple video and host UI alike.
+static inline void SetApplePixel(int x, int y, Color color) {
+	if ((unsigned) x >= APPLE_SOURCE_WIDTH || (unsigned) y >= APPLE_SOURCE_HEIGHT)
+		return;
+	int dstX = APPLE_OUTPUT_X + x;
+	int dstY = APPLE_OUTPUT_Y + y;
+	canvas.setPixel(dstX, dstY, color);
+}
 
 /***************************************************************************************************************************************/
 
@@ -146,6 +180,30 @@ void virtline(unsigned int rastline)
 	{
 		case modetext40:
 			/*text 40 column */
+			if (IsIIeMode() && iie80Column) {
+				addr = textAddr[rastline] + virttextpage;
+				for (int column = 0; column < 80; column++) {
+					unsigned char character = (column & 1) ? RAM[addr] : AUXRAM[addr];
+					if (column & 1) addr++;
+					for (int line = 0; line < 8; line++) {
+						unsigned int glyph;
+						if (character >= 128)
+							glyph = AppleFont[(((character + (character - 128 < ' ' ? 64 : 0)) & 0x7f) << 3) | line];
+						else if (character >= 64)
+							glyph = AppleFont[((character - 0x40) << 3) | line] ^ (iieAltCharset ? 0x00 : flashChar);
+						else
+							glyph = AppleFont[((character + 0x40) << 3) | line] ^ 0xFF;
+						for (int pixel = 0; pixel < 7; pixel++) {
+							int x0 = (column * 7 + pixel) / 2;
+							int x1 = (column * 7 + pixel + 1) / 2;
+							if (x1 == x0) x1++;
+							Color color = (glyph & (0x80 >> pixel)) ? COL_HGR7 : COL_HGR0;
+							for (int x = x0; x < x1; x++) SetApplePixel(x, rastline * 8 + line, color);
+						}
+					}
+				}
+				return;
+			}
 			if (cachedFlashChar != flashChar) {
 				cachedFlashChar = flashChar;
 				textCacheValid = false;
@@ -189,7 +247,7 @@ void virtline(unsigned int rastline)
 						y = (rastline *8) + line;
 						for (bit = 128; bit > 1; bit = bit >> 1)
 						{
-							canvas.setPixel(x, y, (valBits & bit) ? COL_HGR7 : COL_HGR0);
+							SetApplePixel(x, y, (valBits & bit) ? COL_HGR7 : COL_HGR0);
 							x++; /*next pixel */
 						}	// for bit 
 					}	// for line
@@ -202,6 +260,20 @@ void virtline(unsigned int rastline)
 
 		case modelres40:
 			/*lores */
+			if (IsIIeMode() && iie80Column) {
+				addr = textAddr[rastline] + virttextpage;
+				for (int column = 0; column < 80; column++) {
+					unsigned char packed = (column & 1) ? RAM[addr] : AUXRAM[addr];
+					if (column & 1) addr++;
+					for (int line = 0; line < 8; line++) {
+						Color color = loresPalette[line < 4 ? packed & 0x0F : packed >> 4];
+						int x0 = column * 7 / 2;
+						int x1 = (column + 1) * 7 / 2;
+						for (int x = x0; x < x1; x++) SetApplePixel(x, rastline * 8 + line, color);
+					}
+				}
+				return;
+			}
 			if (cachedLoresPage != virttextpage) {
 				cachedLoresPage = virttextpage;
 				loresCacheValid = false;
@@ -227,7 +299,7 @@ void virtline(unsigned int rastline)
 					y = (rastline *8) + line;
 					for (bit = 0; bit < 7; bit++)
 					{
-						canvas.setPixel(x, y, loresPalette[val1]);
+						SetApplePixel(x, y, loresPalette[val1]);
 						x++; /*next pixel */
 					}	// for bit 
 				}	// for line
@@ -239,6 +311,57 @@ void virtline(unsigned int rastline)
 
 		case modehres:
 			/*hires */
+			if (IsIIeMode() && iie80Column && iieDoubleHires) {
+				for (int line = 0; line < 8; line++) {
+					addr = hresaddr[rastline] + hreslineaddr[line] + virthrespage;
+					unsigned char dots[560];
+					int dot = 0;
+					for (int byteIndex = 0; byteIndex < 40; byteIndex++) {
+						unsigned char pair[2] = { AUXRAM[addr + byteIndex], RAM[addr + byteIndex] };
+						for (int bank = 0; bank < 2; bank++)
+							for (int bitIndex = 0; bitIndex < 7; bitIndex++)
+								dots[dot++] = (pair[bank] >> bitIndex) & 1;
+					}
+
+				#if DHR_RENDER_MODE != DHR_COLOR_140
+					// The 320x200 FabGL canvas cannot display 560 independent
+					// horizontal dots. Preserve the canonical stream through this
+					// point, then apply the selected two-dot monochrome reduction.
+					for (int pixel = 0; pixel < 280; pixel++) {
+						int sourceDot = pixel * 2;
+						bool evenDot = dots[sourceDot];
+						bool oddDot = dots[sourceDot + 1];
+					#if DHR_RENDER_MODE == DHR_MONO_PAIR_AND
+						bool on = evenDot && oddDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_EVEN
+						bool on = evenDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_ODD
+						bool on = oddDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_PAIR_XOR
+						bool on = evenDot != oddDot;
+					#elif DHR_RENDER_MODE == DHR_MONO_PAIR_OR
+						bool on = evenDot || oddDot;
+					#endif
+						SetApplePixel(pixel, rastline * 8 + line,
+						              on ? (Color) 15 : (Color) 0);
+					}
+				#else
+					// Existing 140-cell color decode: four consecutive source dots
+					// select one Apple II color, expanded across two output pixels.
+					for (int colorPixel = 0; colorPixel < 140; colorPixel++) {
+						int sourceDot = colorPixel * 4;
+						unsigned char colorIndex = dots[sourceDot]
+						  | (dots[sourceDot + 1] << 1)
+						  | (dots[sourceDot + 2] << 2)
+						  | (dots[sourceDot + 3] << 3);
+						Color color = loresPalette[dhgrToAppleColor[colorIndex]];
+						SetApplePixel(colorPixel * 2, rastline * 8 + line, color);
+						SetApplePixel(colorPixel * 2 + 1, rastline * 8 + line, color);
+					}
+				#endif
+				}
+				return;
+			}
 			if (cachedHiresPage != virthrespage) {
 				cachedHiresPage = virthrespage;
 				hiresCacheValid = false;
@@ -280,7 +403,7 @@ void virtline(unsigned int rastline)
 					Color const * oddPalette = currentByte & 0x80 ? colourtabo2 : colourtabo;
 					for (int pixel = 0; pixel < 7; pixel++) {
 						Color const * palette = ((x + pixel) & 1) ? oddPalette : evenPalette;
-						canvas.setPixel(x + pixel, y, palette[(val >> (pixel + 1)) & 7]);
+						SetApplePixel(x + pixel, y, palette[(val >> (pixel + 1)) & 7]);
 					}
 
 					RAM_HGR_BACK[cacheIndex] = currentByte;
@@ -363,6 +486,40 @@ void CheckVideoIO(word Address) {
       }
       return;
     }
+    case 0xc05e : {
+      if (IsIIeMode()) {
+        // On the IIe this is AN3 off / double-hi-res enabled.
+        if (!iieDoubleHires) {
+          iieDoubleHires = true;
+          InvalidateVideoCaches();
+#if DHR_RENDER_MODE == DHR_COLOR_140
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=color-140");
+#elif DHR_RENDER_MODE == DHR_MONO_PAIR_AND
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-and");
+#elif DHR_RENDER_MODE == DHR_MONO_EVEN
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-even-dots");
+#elif DHR_RENDER_MODE == DHR_MONO_ODD
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-odd-dots");
+#elif DHR_RENDER_MODE == DHR_MONO_PAIR_XOR
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-xor");
+#elif DHR_RENDER_MODE == DHR_MONO_PAIR_OR
+          DEBUG_PRINTLN("[VIDEO] double-hi-res enabled ($C05E), renderer=mono-pair-or");
+#endif
+        }
+      }
+      return;
+    }
+    case 0xc05f : {
+      if (IsIIeMode()) {
+        // On the IIe this is AN3 on / double-hi-res disabled.
+        if (iieDoubleHires) {
+          iieDoubleHires = false;
+          InvalidateVideoCaches();
+          DEBUG_PRINTLN("[VIDEO] double-hi-res disabled ($C05F)");
+        }
+      }
+      return;
+    }
  }
 }
 
@@ -390,7 +547,9 @@ void virtsetmode() {
     virtmodedown = modetext40;
   }
 
-  if (!(gm & PG2)) {
+  // With 80STORE enabled, PAGE2 selects the main/aux bank for video memory;
+  // the displayed address remains the page-1 range.
+  if (!(gm & PG2) || IIe80StoreEnabled()) {
     /* set the visible page */
     virttextpage = 0x400;
     virthrespage = 0x2000;

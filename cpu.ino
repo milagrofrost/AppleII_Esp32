@@ -32,6 +32,8 @@
 #define AD_ZPG	0x0B
 #define AD_ZPGX	0x0C
 #define AD_ZPGY	0x0D
+#define AD_ZPIND 0x0E
+#define AD_ABSINDX 0x0F
 
 // SR Flag Modes
 #define FL_Z 	  0x20
@@ -108,6 +110,68 @@ unsigned short argument_addr;
 //Temporary variables for flag generation
 unsigned char value8;
 unsigned short value16, value16_2, result;
+#if ENABLE_CPU_TRACE
+static unsigned int brkTraceCount = 0;
+static unsigned int cmosUnhandledTraceCount = 0;
+#endif
+
+static bool IsHandledCMOSOpcode(unsigned char op) {
+  switch (op) {
+    case 0x04: case 0x0C: case 0x14: case 0x1C:
+    case 0x12: case 0x32: case 0x52: case 0x72: case 0x92: case 0xB2: case 0xD2: case 0xF2:
+    case 0x34: case 0x3C: case 0x89:
+    case 0x64: case 0x74: case 0x9C: case 0x9E:
+    case 0x1A: case 0x3A: case 0x5A: case 0x7A: case 0xDA: case 0xFA:
+    case 0x7C: case 0x80:
+    case 0x02: case 0x22: case 0x42: case 0x62: case 0x82: case 0xC2: case 0xE2:
+    case 0x44: case 0x54: case 0xD4: case 0xF4: case 0x5C: case 0xDC: case 0xFC:
+    case 0xCB: case 0xDB:
+      return true;
+  }
+  return (op & 0x0F) == 0x07 || (op & 0x0F) == 0x0F;
+}
+
+static unsigned char CMOSAddressMode(unsigned char op) {
+  switch (op) {
+    case 0x04: case 0x14: case 0x64: return AD_ZPG;
+    case 0x0C: case 0x1C: case 0x9C: return AD_ABS;
+    case 0x12: case 0x32: case 0x52: return FL_ZN | AD_ZPIND;
+    case 0x72: case 0xF2: return FL_ALL | AD_ZPIND;
+    case 0x92: return AD_ZPIND;
+    case 0xB2: return FL_ZN | AD_ZPIND;
+    case 0xD2: return FL_ZNC | AD_ZPIND;
+    case 0x34: case 0x74: return AD_ZPGX;
+    case 0x3C: case 0x9E: return AD_ABSX;
+    case 0x7C: return AD_ABSINDX;
+    case 0x80: return AD_REL;
+    case 0x89: return AD_IMM;
+    case 0x02: case 0x22: case 0x42: case 0x62:
+    case 0x82: case 0xC2: case 0xE2: return AD_IMM;
+    case 0x44: return AD_ZPG;
+    case 0x54: case 0xD4: case 0xF4: return AD_ZPGX;
+    case 0x5C: return AD_ABS;
+    case 0xDC: case 0xFC: return AD_ABSX;
+  }
+  if ((op & 0x0F) == 0x07) return AD_ZPG; // RMB/SMB
+  return AD_IMP;
+}
+
+static unsigned char CMOSCycles(unsigned char op) {
+  switch (op) {
+    case 0x04: case 0x14: return 5;
+    case 0x0C: case 0x1C: return 6;
+    case 0x12: case 0x32: case 0x52: case 0x72:
+    case 0xB2: case 0xD2: case 0xF2: return 5;
+    case 0x92: return 5;
+    case 0x34: return 4; case 0x3C: return 4; case 0x89: return 2;
+    case 0x64: return 3; case 0x74: return 4; case 0x9C: return 4; case 0x9E: return 5;
+    case 0x1A: case 0x3A: case 0x5A: case 0xDA: return 3;
+    case 0x7A: case 0xFA: return 4;
+    case 0x7C: return 6; case 0x80: return 3;
+  }
+  if ((op & 0x0F) == 0x07) return 5;
+  return 2;
+}
 
 /***************************************************************************************************************************************/
 
@@ -183,11 +247,31 @@ void execCode() {
 
     // Get opcode / addressing mode
     opcode = read8(PC++);
+    CPUInstructionOpcode = opcode;
     opflags = flags[opcode];
     instructionCycles = pgm_read_byte_near(opcodeCycles + opcode);
+    bool cmosBitBranch = Is65C02Mode() && (opcode & 0x0F) == 0x0F;
+    bool baseOpcodeUndefined = opflags == UNDF;
+    if (Is65C02Mode() && baseOpcodeUndefined) {
+      opflags = CMOSAddressMode(opcode);
+      instructionCycles = CMOSCycles(opcode);
+#if ENABLE_CPU_TRACE
+      if (!IsHandledCMOSOpcode(opcode) && cmosUnhandledTraceCount < 24) {
+        DEBUG_PRINTF("[CPU65] unhandled opcode=%02X at PC=%04X\n", opcode, (unsigned short)(PC - 1));
+        cmosUnhandledTraceCount++;
+      }
+#endif
+    }
+
+    if (cmosBitBranch) {
+      argument_addr = read8(PC++); // zero-page byte to test
+      value16_2 = read8(PC++);     // signed relative displacement
+      if (value16_2 & 0x80) value16_2 |= 0xFF00;
+      instructionCycles = 5;
+    }
   
     // Addressing modes
-    switch(opflags&0x0F) {
+    if (!cmosBitBranch) switch(opflags&0x0F) {
       case AD_IMP: case AD_A: argument_addr = 0xFFFF; break;
       case AD_ABS:
         argument_addr = read16(PC);
@@ -210,7 +294,8 @@ void execCode() {
         break;
       case AD_IND:
         argument_addr = read16(PC);
-        value16 = (argument_addr&0xFF00) | ((argument_addr+1)&0x00FF); // Page wrap
+        value16 = Is65C02Mode() ? argument_addr + 1
+                                : (argument_addr&0xFF00) | ((argument_addr+1)&0x00FF);
         argument_addr = (unsigned short)read8(argument_addr) | ((unsigned short)read8(value16) << 8);
         PC+=2;
         break;
@@ -240,6 +325,18 @@ void execCode() {
       case AD_ZPGY:
         argument_addr = ((unsigned short)read8(PC++) + (unsigned short)Y)&0xFF;
         break;
+      case AD_ZPIND:
+        value16 = read8(PC++);
+        argument_addr = (unsigned short) readPgz8(value16) |
+                        ((unsigned short) readPgz8((value16 + 1) & 0xFF) << 8);
+        break;
+      case AD_ABSINDX:
+        value16 = read16(PC);
+        PC += 2;
+        value16 += X;
+        argument_addr = (unsigned short) read8(value16) |
+                        ((unsigned short) read8(value16 + 1) << 8);
+        break;
       }
 
       if (pageCrossed) {
@@ -258,6 +355,63 @@ void execCode() {
 
       //opcodes
       switch(opcode) {
+        // 65C02 additions
+        case 0x04: case 0x0C: // TSB
+          value8 = read8(argument_addr); result = A & value8;
+          SR = (SR & ~SR_ZERO) | ((result & 0xFF) ? 0 : SR_ZERO);
+          write8(argument_addr, value8 | A); break;
+        case 0x14: case 0x1C: // TRB
+          value8 = read8(argument_addr); result = A & value8;
+          SR = (SR & ~SR_ZERO) | ((result & 0xFF) ? 0 : SR_ZERO);
+          write8(argument_addr, value8 & ~A); break;
+        case 0x12: case 0x32: case 0x52: case 0x72:
+        case 0xB2: case 0xD2: case 0xF2: {
+          value8 = read8(argument_addr);
+          if (opcode == 0x12) { result = A | value8; A = result; setflags(); }
+          else if (opcode == 0x32) { result = A & value8; A = result; setflags(); }
+          else if (opcode == 0x52) { result = A ^ value8; A = result; setflags(); }
+          else if (opcode == 0x72) { value16 = value8; result = A + value16 + (SR & SR_CARRY); setflags(); A = result; }
+          else if (opcode == 0xB2) { A = value8; result = A; setflags(); }
+          else if (opcode == 0xD2) { value16 = ((unsigned short)value8) ^ 0xFF; result = A + value16 + 1; setflags(); }
+          else { value16 = ((unsigned short)value8) ^ 0xFF; result = A + value16 + (SR & SR_CARRY); setflags(); A = result; }
+          break;
+        }
+        case 0x92: write8(argument_addr, A); break; // STA (zp)
+        case 0x34: case 0x3C: case 0x89: // BIT new modes
+          value8 = read8(argument_addr); result = A & value8;
+          SR = (SR & ~SR_ZERO) | ((result & 0xFF) ? 0 : SR_ZERO);
+          if (opcode != 0x89) SR = (SR & 0x3F) | (value8 & 0xC0);
+          break;
+        case 0x64: case 0x74: case 0x9C: case 0x9E: write8(argument_addr, 0); break;
+        case 0x1A: result = ++A; opflags = FL_ZN; setflags(); break;
+        case 0x3A: result = --A; opflags = FL_ZN; setflags(); break;
+        case 0x5A: push8(Y); break;
+        case 0x7A: Y = pull8(); result = Y; opflags = FL_ZN; setflags(); break;
+        case 0xDA: push8(X); break;
+        case 0xFA: X = pull8(); result = X; opflags = FL_ZN; setflags(); break;
+        case 0x7C: PC = argument_addr; break;
+        case 0x80: value16 = PC; PC += argument_addr; instructionCycles += ((value16 & 0xFF00) != (PC & 0xFF00)); break;
+        case 0x07: case 0x17: case 0x27: case 0x37:
+        case 0x47: case 0x57: case 0x67: case 0x77:
+        case 0x87: case 0x97: case 0xA7: case 0xB7:
+        case 0xC7: case 0xD7: case 0xE7: case 0xF7: {
+          unsigned char mask = 1 << ((opcode >> 4) & 7);
+          value8 = readPgz8(argument_addr);
+          writePgz8(argument_addr, opcode & 0x80 ? value8 | mask : value8 & ~mask);
+          break;
+        }
+        case 0x0F: case 0x1F: case 0x2F: case 0x3F:
+        case 0x4F: case 0x5F: case 0x6F: case 0x7F:
+        case 0x8F: case 0x9F: case 0xAF: case 0xBF:
+        case 0xCF: case 0xDF: case 0xEF: case 0xFF: {
+          unsigned char mask = 1 << ((opcode >> 4) & 7);
+          bool set = (readPgz8(argument_addr) & mask) != 0;
+          if (set == ((opcode & 0x80) != 0)) {
+            value16 = PC; PC += value16_2;
+            instructionCycles += 1 + ((value16 & 0xFF00) != (PC & 0xFF00));
+          }
+          break;
+        }
         //ADC
         case 0x65:
           value16 = (unsigned short)readPgz8(argument_addr);
@@ -369,10 +523,30 @@ void execCode() {
           break;
         //BRK
         case 0x00:
+#if ENABLE_CPU_TRACE
+          if (brkTraceCount < 24) {
+            unsigned short origin = PC - 1;
+            unsigned short vector = read16(0xFFFE);
+            DEBUG_PRINTF("[CPU] BRK at %04X next=%02X vector=%04X SP=%02X SR=%02X total=%llu base=%llu\n",
+                         origin, read8(PC), vector, STP, SR,
+                         TotalCycles, EmulationTimingBaseCycles);
+            if (brkTraceCount == 0) {
+              DEBUG_PRINT("[CPU] pre-BRK history:");
+              for (int historyOffset = 0; historyOffset < 16; historyOffset++) {
+                unsigned char historyIndex = (CPURecentIndex + historyOffset) & 0x0F;
+                DEBUG_PRINTF(" %04X:%02X@%04X", CPURecentPC[historyIndex],
+                             CPURecentOpcode[historyIndex], CPURecentArgument[historyIndex]);
+              }
+              DEBUG_PRINTLN();
+            }
+            brkTraceCount++;
+          }
+#endif
           PC++;
           push16(PC);
           push8(SR|SR_BRK);
           SR|=SR_INT;
+          if (Is65C02Mode()) SR &= ~SR_DEC;
           PC = read16(0xFFFE);
           break;
         //BVC
