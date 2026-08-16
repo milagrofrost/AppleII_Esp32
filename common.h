@@ -89,13 +89,13 @@ void PrintDiskHostIOState();
 bool ConsumeDiskFlushResume(uint32_t * transaction, unsigned long * elapsedMs);
 void ArmDiskPointerWatchpoint();
 void PrintIIeMemoryDiagnostic(unsigned short address);
-void CaptureNMOS80MemoryProvenance(unsigned short address);
-void InitializeLCProvenanceDiagnostics();
-void RecordD6ControlFlow(unsigned short instructionPC, unsigned char instructionOpcode,
-                         unsigned short effectiveAddress, unsigned char preA,
-                         unsigned char preX, unsigned char preY, unsigned char preSP,
-                         unsigned char preSR, uint64_t preCycles,
-                         unsigned short nextPC);
+void CaptureMemoryRangeDiagnostics(unsigned short address);
+void InitializeMemoryProvenanceDiagnostics();
+void RecordMemoryDiagnosticControlFlow(
+  unsigned short instructionPC, unsigned char instructionOpcode,
+  unsigned short effectiveAddress, unsigned char preA,
+  unsigned char preX, unsigned char preY, unsigned char preSP,
+  unsigned char preSR, uint64_t preCycles, unsigned short nextPC);
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();

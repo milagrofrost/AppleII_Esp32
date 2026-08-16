@@ -46,6 +46,21 @@
 #define ENABLE_DISK_SECTOR_TRACE 0
 #endif
 
+// One-shot writable-memory provenance and control-flow diagnostic. Change
+// only these bounds to retarget the existing bounded framework.
+#ifndef MEMORY_DIAGNOSTIC_FIRST
+#define MEMORY_DIAGNOSTIC_FIRST 0x4BE0
+#endif
+#ifndef MEMORY_DIAGNOSTIC_LAST
+#define MEMORY_DIAGNOSTIC_LAST 0x4C70
+#endif
+#ifndef MEMORY_DIAGNOSTIC_TRIGGER_FIRST
+#define MEMORY_DIAGNOSTIC_TRIGGER_FIRST 0x4C0C
+#endif
+#ifndef MEMORY_DIAGNOSTIC_TRIGGER_LAST
+#define MEMORY_DIAGNOSTIC_TRIGGER_LAST 0x4C54
+#endif
+
 #if (ENABLE_CPU_VALIDATION_TEST + ENABLE_IIE_BANKING_VALIDATION_TEST + \
      ENABLE_KLAUS_CPU_TEST + ENABLE_DISK_II_VALIDATION_TEST + \
      ENABLE_DISK_OVERLAY_VALIDATION_TEST) > 1

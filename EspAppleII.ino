@@ -281,9 +281,9 @@ void Task1code( void * pvParameters ){
     uint64_t traceCycles = TotalCycles;
     CPUExecutionStage = 1; // fetching/executing a 6502 instruction
     execCode();
-    RecordD6ControlFlow(CPUInstructionStartPC, CPUInstructionOpcode,
-                        argument_addr, traceA, traceX, traceY, traceSP,
-                        traceSR, traceCycles, PC);
+    RecordMemoryDiagnosticControlFlow(
+      CPUInstructionStartPC, CPUInstructionOpcode, argument_addr,
+      traceA, traceX, traceY, traceSP, traceSR, traceCycles, PC);
     CPURecentPC[CPURecentIndex] = CPUInstructionStartPC;
     CPURecentOpcode[CPURecentIndex] = CPUInstructionOpcode;
     CPURecentArgument[CPURecentIndex] = argument_addr;
@@ -562,7 +562,7 @@ void setup()
     return;
   }
 
-  InitializeLCProvenanceDiagnostics();
+  InitializeMemoryProvenanceDiagnostics();
 
   canvas.setPenColor(Color::BrightGreen);
   canvas.drawText(20, 50, "Disk loaded from SD:");
