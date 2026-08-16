@@ -4,7 +4,23 @@
 
 This project emulates an original Apple II on an ESP32, with VGA video, PS/2 keyboard input, and sound. It is intended both as a usable nostalgic emulator and as an educational example of 6502, Apple II video, and Disk II emulation on a modern microcontroller.
 
-The project was originally created by Francisco J. A. Souza. The 6502 and disk-emulation sources were adapted from earlier emulator projects; their original authors should be credited when they are identified.
+The project was originally created by Francisco J. A. Souza.
+
+## Credits and acknowledgements
+
+EspAppleII is built on, tested with, and informed by work from the wider Apple II and ESP32 open-source communities:
+
+- **Francisco J. A. Souza** created the original EspAppleII project and its ESP32 emulator foundation. The source files retain his copyright notices.
+- **Fabrizio Di Vittorio and the FabGL contributors** created [FabGL](https://github.com/fdivitto/FabGL), which provides the VGA, PS/2, graphics, and audio foundation used by this project.
+- **Olimex** maintains the [Olimex FabGL fork](https://github.com/OLIMEX/FabGL) and designed the ESP32-SBC-FabGL hardware targeted by this repository.
+- **Jack Christensen** created the [Arduino Timer library](https://github.com/JChristensen/Timer) used by the firmware.
+- **The AppleWin project and its contributors** provide a mature Apple II/IIe behavioral reference. AppleWin has informed compatibility work involving CPU edge cases, Disk II controller behavior, video/DHR color mapping, and memory behavior. See [AppleWin](https://github.com/AppleWin/AppleWin).
+- **Will Scullin and Apple2JS contributors** provide a readable Apple II implementation used as a behavioral reference for IIe memory, soft switches, Disk II, and video. See [Apple2JS](https://github.com/whscullin/apple2js).
+- **Ivan X and izapple2 contributors**, **Thomas Harte and CLK contributors**, and the **MiSTer Apple II contributors** provide additional behavioral and architectural references: [izapple2](https://github.com/ivanizag/izapple2), [CLK](https://github.com/TomHarte/CLK), and [Apple-II MiSTer](https://github.com/MiSTer-devel/Apple-II_MiSTer).
+- **Klaus Dormann** created the [6502/65C02 functional test suites](https://github.com/Klaus2m5/6502_65C02_functional_tests) used to validate the CPU core.
+- **Zellyn Hunter and a2audit contributors** created [a2audit](https://github.com/zellyn/a2audit), which is used as a reference and future validation target for Apple II-family memory and soft-switch correctness.
+
+References to these projects describe their specific influence; they do not imply endorsement. Their code and test assets remain subject to their respective copyright and license terms. Apple ROMs and commercial disk images are not included in this repository.
 
 ## Current hardware target
 
@@ -162,6 +178,12 @@ The firmware stores compact catalog records and a shared path-string pool in PSR
 
 Normal Arduino IDE builds use the debug profile. It enables serial diagnostics, limited CPU and Disk II traces, and stack high-water reporting every ten seconds.
 
+For an isolated serial-only CPU smoke test, set `ENABLE_CPU_VALIDATION_TEST` to `1` in `build_config.h`. This stops before VGA, PS/2, SD, and normal emulation, then exercises representative NMOS 6502 and 65C02 instructions and prints one `PASS` or `FAIL` line per check followed by a summary. Set it back to `0` for normal emulation. The smoke test is an initial harness; the longer Klaus Dormann functional binaries remain the next CPU-validation milestone.
+
+For an isolated Apple IIe memory-banking test, set `ENABLE_IIE_BANKING_VALIDATION_TEST` to `1`. It validates MAIN/AUX routing, `RAMRD`, `RAMWRT`, `ALTZP`, `80STORE`, `PAGE2`, `HIRES`, language-card banks and write locking, ROM visibility, and IIe status reads without starting VGA, PS/2, SD, or normal emulation.
+
+For the complete Klaus Dormann functional tests, copy the two official 64K binaries described in `tests/klaus/README.md` to `/apple2/tests` on the SD card and set `ENABLE_KLAUS_CPU_TEST` to `1`. The serial-only runner uses a flat 64K address space, reports progress every five million instructions, and stops at the first upstream failure trap or success loop.
+
 For a quiet release build, define this compiler symbol:
 
 ```text
@@ -199,7 +221,11 @@ Press **Ctrl+Alt+Delete** while emulation is running to reopen the disk selector
 
 Press **Ctrl+Alt+S** to replace the disk in drive 1 without resetting the emulated machine. Use this when software asks for another disk side: select the requested side, press **Enter**, then press the key or joystick button requested by the software. RAM, CPU registers, video mode, and the active machine profile are preserved during the swap.
 
+Press **Ctrl+Alt+D** to insert or replace media in drive 2 without resetting or changing drive 1. This supports two-drive software: boot Side A or the program disk in drive 1, use **Ctrl+Alt+D** to select Side B/data media for drive 2, then return to the software and press the requested key. The drive head/controller and complete Apple II machine state are preserved.
+
 Disk writes use copy-on-write save images. The first successful write creates a neighboring `<original filename>.sav.dsk`; later launches automatically load that save image while leaving the original archive disk unchanged. Delete the `.sav.dsk` file to discard saved progress and return to the original disk state.
+
+To discard a save directly on the ESP32, highlight its original disk image in the disk selector and press **Delete**. The selector shows the disk name and requires **Y** before removing only its neighboring `.sav.dsk`; press **N** or **Escape** to cancel. The original disk image is never removed. Loading the disk afterward creates a fresh writable overlay from the clean original image.
 
 The selector is shown even for a one-entry index so the machine profile can still be changed with **Tab**.
 

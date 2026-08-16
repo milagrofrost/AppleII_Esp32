@@ -254,6 +254,7 @@ void Task1code( void * pvParameters ){
 
   initCode();  
   DEBUG_PRINTF("[CPU] reset complete PC=%04X SP=%02X SR=%02X\n", PC, STP, SR);
+  ArmDiskPointerWatchpoint();
   unsigned long instructionCount = 0;
   unsigned long nextTrace = 1000000UL;
   unsigned int tracesRemaining = 8;
@@ -282,6 +283,14 @@ void Task1code( void * pvParameters ){
     CPURecentIndex = (CPURecentIndex + 1) & 0x0F;
     CPUExecutionStage = 0;
     CPUInstructionHeartbeat++;
+    uint32_t resumedDiskTransaction;
+    unsigned long diskFlushElapsed;
+    if (ConsumeDiskFlushResume(&resumedDiskTransaction, &diskFlushElapsed)) {
+      DEBUG_PRINTF("[HOSTIO] CPU resumed after disk transaction=%lu "
+                   "flushElapsed=%lums nextPC=%04X heartbeat=%lu\n",
+                   (unsigned long) resumedDiskTransaction, diskFlushElapsed,
+                   PC, (unsigned long) CPUInstructionHeartbeat);
+    }
 #if ENABLE_CPU_TRACE
     instructionCount++;
     if (tracesRemaining && instructionCount == nextTrace) {
@@ -323,6 +332,7 @@ void Task1code( void * pvParameters ){
       DEBUG_PRINTF(" joy=%u,%u button=%u\n",
                    (unsigned) HostPaddleValue(0), (unsigned) HostPaddleValue(1),
                    (unsigned) HostJoystickButton(0));
+      CheckDiskLoaderSearch();
       if (instructionDelta && CPUInstructionStartPC == previousReportPC) {
         DEBUG_PRINT("[CPU-LIVE] repeating-PC history:");
         for (int historyOffset = 0; historyOffset < 16; historyOffset++) {
@@ -416,10 +426,13 @@ void Task2code( void * pvParameters ){
                      (int) esp_reset_reason());
       }
       if (currentCPUHeartbeat == lastCPUHeartbeat) {
-        DEBUG_PRINTF("[TASK] CPU STALLED taskState=%d stage=%u PC=%04X opcode=%02X cycle=%lu\n",
-                     Task1 ? (int) eTaskGetState(Task1) : -1,
-                     (unsigned) CPUExecutionStage, CPUInstructionStartPC,
-                     CPUInstructionOpcode, cycle);
+        PrintDiskHostIOState();
+        if (!DiskHostIOActive) {
+          DEBUG_PRINTF("[TASK] CPU STALLED taskState=%d stage=%u PC=%04X opcode=%02X cycle=%lu\n",
+                       Task1 ? (int) eTaskGetState(Task1) : -1,
+                       (unsigned) CPUExecutionStage, CPUInstructionStartPC,
+                       CPUInstructionOpcode, cycle);
+        }
       }
       lastCPUHeartbeat = currentCPUHeartbeat;
       nextStackReport += 10000;
@@ -443,6 +456,36 @@ void setup()
   DEBUG_PRINTLN( "EspApple II Emulator (ESP32) ");
   DEBUG_PRINTF("[BOOT] resetReason=%d freeHeap=%u maxAlloc=%u\n",
                (int) esp_reset_reason(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+#if ENABLE_CPU_VALIDATION_TEST
+  RunCPUValidationTests();
+  for (;;)
+    delay(1000);
+#endif
+
+#if ENABLE_IIE_BANKING_VALIDATION_TEST
+  RunIIeBankingValidationTests();
+  for (;;)
+    delay(1000);
+#endif
+
+#if ENABLE_KLAUS_CPU_TEST
+  RunKlausCPUValidationTests();
+  for (;;)
+    delay(1000);
+#endif
+
+#if ENABLE_DISK_II_VALIDATION_TEST
+  RunDiskIIValidationTests();
+  for (;;)
+    delay(1000);
+#endif
+
+#if ENABLE_DISK_OVERLAY_VALIDATION_TEST
+  RunDiskOverlayValidationTests();
+  for (;;)
+    delay(1000);
+#endif
 
   // Disable the watchdog on both cores
   disableCore0WDT();

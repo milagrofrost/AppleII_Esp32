@@ -78,12 +78,14 @@ bool InitializeMachineProfiles() {
     fclose(rom);
   }
 
-  // Prefer the most capable IIe profile at startup. The disk selector still
-  // cycles through every available profile, including Apple II+ 64K.
-  if (EnhancedIIeROMAvailable)
-    SetMachineProfile(APPLE_IIE_ENHANCED_128K);
-  else if (IIeROMAvailable)
+  // The original Apple IIe 128K is the broadest game-compatibility default:
+  // it provides IIe memory/video features while retaining the NMOS 6502
+  // behavior expected by software such as the Carmen Sandiego 4am crack.
+  // Enhanced IIe and Apple II+ remain selectable from the disk menu with Tab.
+  if (IIeROMAvailable)
     SetMachineProfile(APPLE_IIE_128K);
+  else if (EnhancedIIeROMAvailable)
+    SetMachineProfile(APPLE_IIE_ENHANCED_128K);
   else
     SetMachineProfile(APPLE_II_PLUS_64K);
 

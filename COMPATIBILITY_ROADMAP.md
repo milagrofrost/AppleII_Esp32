@@ -539,14 +539,110 @@ Use as the primary standalone CPU correctness suite for NMOS 6502 and 65C02 beha
 
 # Suggested implementation order
 
+## Current validation baseline
+
+- Built-in isolated CPU smoke harness: **29/29 PASS on ESP32 hardware**
+- NMOS 6502 coverage: basic loads/flags, binary ADC, relative branch,
+  JSR/RTS, indirect-JMP page wrap, decimal ADC/SBC
+- 65C02 coverage: BRA, STZ, PHX/PLX, `(zp)`, corrected indirect JMP,
+  decimal ADC/SBC
+- Klaus Dormann flat-memory SD runner: **2/2 PASS on ESP32 hardware**
+- NMOS 6502 functional test: **PASS**, 30,646,184 instructions and
+  96,241,388 cycles in 48,635 ms
+- 65C02 extended-opcode test: **PASS**, 21,986,993 instructions and
+  66,907,153 cycles in 36,059 ms
+- CPU baseline established on hardware. Keep the smoke and Klaus runners as
+  opt-in regression targets while normal emulation remains the default build.
+- Built-in isolated IIe banking harness: **8/8 PASS on ESP32 hardware**
+- IIe coverage: MAIN/AUX `RAMRD`/`RAMWRT`, `ALTZP` zero page/stack,
+  `80STORE` text/HGR routing, language-card banks/ROM/write locking,
+  auxiliary language-card selection, and soft-switch status reads
+- Next IIe memory milestone: run the relevant a2audit suites and add Cxxx
+  internal/slot-ROM latch coverage
+- Disk II controller/write-path validation harness: **7/7 controller checks
+  PASS on ESP32 hardware**. Initial coverage is motor state, write-protect sensing,
+  cycle-derived rotation, stepper movement, Q6/Q7 write gating, protected-media
+  writes, and 6-and-2 nibble encode/decode round trips. The first harness run
+  also exposed and corrected a diagnostic-only 256-versus-258-byte padding
+  allocation around the legacy codec. SD persistence is kept separate so
+  controller failures cannot be confused with filesystem latency.
+- Isolated SD save-overlay harness: **9/9 PASS on ESP32 hardware**.
+  It creates a dedicated deterministic image under `/SD/apple2/tests`, runs
+  the production copy-on-write creation/load path, updates and flushes one
+  sector, reopens it for byte-for-byte verification, checks both neighboring
+  bytes, and removes its own base/overlay files. It never opens a game image.
+  Measured hardware latency was 3,249 ms to create the base test image,
+  10,506 ms for production overlay creation plus buffered loading, 116 ms for
+  one targeted 256-byte memory update/flush, and 93 ms to reopen/read/verify.
+  Data integrity is established; the remaining Carmen save investigation
+  should distinguish long synchronous host I/O from an actual CPU/controller
+  deadlock and should avoid treating an intentional host pause as a CPU stall.
+- Host-I/O correlation diagnostics are now integrated for normal-emulation
+  testing. Transaction IDs and elapsed times cover overlay creation, image
+  loading, track flushes, and sector persistence. Q7 write sessions report
+  their first data byte, byte count, track, rotational index, cycle, and PC;
+  subsequent flushes include the most recent write-session identity. The task
+  monitor reports active filesystem work as `CPU HOST-IO-WAIT`, and a flush
+  performed by the CPU task emits an explicit `CPU resumed` event after the
+  triggering 6502 instruction completes.
+- Carmen Sandiego v2.0 (4am crack) exposes an NMOS-profile dependency: its
+  loaded language-card code uses `$80 operand` as a two-byte undocumented NOP.
+  Enhanced IIe/65C02 hardware interprets `$80` as `BRA`, producing the observed
+  backward branch into a BRK trap. NMOS undefined-NOP operand lengths are now
+  modeled and regression-tested; this particular image should be run with the
+  non-enhanced `APPLE IIE 128K` profile rather than title-specific 65C02 hacks.
+  The regular Apple IIe 128K profile is therefore the normal startup default;
+  Enhanced IIe and Apple II+ remain selectable from the disk menu.
+- A clean Carmen load also executes the stable undocumented NMOS `$07` SLO
+  instruction. Treating it as a one-byte undefined opcode consumed its
+  operand as the next instruction and sent execution into data. The NMOS core
+  now implements the stable SLO, RLA, SRE, RRA, SAX, LAX, DCP, and ISC opcode
+  families across their documented addressing forms, plus ANC, ALR, ARR,
+  AXS/SBX, and unofficial immediate SBC. The CPU smoke harness contains an
+  isolated semantic regression for every family. Enhanced IIe retains its
+  distinct 65C02 interpretations; unstable bus-dependent opcodes and JAM/KIL
+  remain deliberately unsupported rather than being assigned invented
+  behavior.
+  The expanded smoke suite, including all of these stable undocumented NMOS
+  families and the existing 65C02 checks, passed **29/29 on ESP32 hardware**.
+- Carmen also probes/selects an empty drive 2 during detection. This probe is
+  not evidence that its later insertion prompt expects media in drive 2; a
+  hardware trace with Side B mounted there showed subsequent loading remained
+  on drive 1. Empty media was incorrectly
+  mounted as a 143,360-byte DOS image and failed reads were nibblized into a
+  synthetic zero-filled disk. Empty drives now remain size-zero, unknown-type,
+  write-protected media and expose an all-`$FF` no-prologue track stream so
+  normal drive-detection code can time out cleanly. A null active pointer is
+  no longer reported as corruption when the mounted-media guard is also null.
+- Runtime drive-2 insertion is available through `Ctrl+Alt+D`. It reuses the
+  indexed disk selector and production copy-on-write loader, assigns the
+  second PSRAM disk buffer, identifies the inserted image format, and resumes
+  without resetting CPU, RAM, video, machine profile, or drive-1 media.
+- Custom-loader diagnostics now retain the latest 48 Disk II controller
+  accesses in an internal-RAM ring without serial output on the live path.
+  Three consecutive ten-second, motor-on, read-heavy intervals on one track
+  emit one `[DISK-SEARCH]` snapshot with Q6/Q7, latch, rotational index,
+  access-cycle delta, PC, and returned-nibble history. This targets loaders
+  such as Carmen Sandiego without filename or PC-specific behavior.
+- Disk II latch/rotation behavior was compared against AppleWin and Apple2JS.
+  Track rebuilds after stepping preserve rotational index instead of snapping
+  to nibble zero. A first-pass approximation exposed guessed partial bits
+  between 32-cycle nibble boundaries; Carmen subsequently loaded corrupt code
+  into the language card and trapped after `JSR $D20C`. That approximation was
+  removed. Until a bit-accurate sequencer is implemented, intermediate reads
+  retain the earlier zero-until-complete-nibble behavior. The isolated Disk II
+  regression now records this compatibility behavior explicitly.
+
 ## Phase 1: Correctness harness
 
-1. structured trace ring
-2. automatic failure snapshot
-3. integrate/run 6502 functional tests
-4. integrate/run 65C02 functional tests
+1. build and run an isolated CPU smoke-test harness
+2. integrate/run 6502 functional tests
+3. integrate/run 65C02 functional tests
+4. build a deterministic IIe memory/soft-switch test
 5. integrate/run a2audit
-6. record baseline compatibility matrix
+6. structured trace ring
+7. automatic failure snapshot
+8. record baseline compatibility matrix
 
 ## Phase 2: Machine model cleanup
 

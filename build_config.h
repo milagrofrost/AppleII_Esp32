@@ -11,6 +11,47 @@
 #define ENABLE_VGA_PALETTE_TEST 0
 #endif
 
+// Set to 1 for a serial-only CPU validation run. The test stops before VGA,
+// PS/2, SD, and normal emulation startup.
+#ifndef ENABLE_CPU_VALIDATION_TEST
+#define ENABLE_CPU_VALIDATION_TEST 0
+#endif
+
+// Set to 1 for a serial-only Apple IIe banking/soft-switch validation run.
+#ifndef ENABLE_IIE_BANKING_VALIDATION_TEST
+#define ENABLE_IIE_BANKING_VALIDATION_TEST 0
+#endif
+
+// Set to 1 to load and run the official 64K Klaus Dormann CPU test binaries
+// from /apple2/tests on SD. This is a serial-only flat-memory CPU test.
+#ifndef ENABLE_KLAUS_CPU_TEST
+#define ENABLE_KLAUS_CPU_TEST 0
+#endif
+
+// Set to 1 for an isolated, serial-only Disk II controller/write-path test.
+// It uses only an in-memory track and never creates or modifies an SD file.
+#ifndef ENABLE_DISK_II_VALIDATION_TEST
+#define ENABLE_DISK_II_VALIDATION_TEST 0
+#endif
+
+// Set to 1 for an isolated SD copy-on-write overlay validation run. It creates
+// and removes only /SD/apple2/tests/espappleii-overlay-validation*.dsk files.
+#ifndef ENABLE_DISK_OVERLAY_VALIDATION_TEST
+#define ENABLE_DISK_OVERLAY_VALIDATION_TEST 0
+#endif
+
+// Set to 1 only when individual sector offsets are needed. Printing every
+// sector synchronously delays the first Disk II track builds on hardware.
+#ifndef ENABLE_DISK_SECTOR_TRACE
+#define ENABLE_DISK_SECTOR_TRACE 0
+#endif
+
+#if (ENABLE_CPU_VALIDATION_TEST + ENABLE_IIE_BANKING_VALIDATION_TEST + \
+     ENABLE_KLAUS_CPU_TEST + ENABLE_DISK_II_VALIDATION_TEST + \
+     ENABLE_DISK_OVERLAY_VALIDATION_TEST) > 1
+#error "Enable only one isolated validation harness at a time"
+#endif
+
 // IIe double-hi-res presentation/reduction modes for the 280-column Apple
 // output area on the confirmed 320x200 FabGL canvas.
 #define DHR_COLOR_140     0
@@ -33,9 +74,13 @@
   #define ENABLE_CPU_TRACE 0
   #define ENABLE_DISK_DIAGNOSTICS 0
   #define ENABLE_STACK_TELEMETRY 0
+  #define ENABLE_DISK_POINTER_WATCHPOINT 0
 #else
   #define ENABLE_SERIAL_DEBUG 1
   #define ENABLE_CPU_TRACE 1
   #define ENABLE_DISK_DIAGNOSTICS 1
   #define ENABLE_STACK_TELEMETRY 1
+  // Panic at the exact native store that overwrites the stable disk-owner
+  // pointer block. This is a temporary compatibility diagnostic.
+  #define ENABLE_DISK_POINTER_WATCHPOINT 1
 #endif

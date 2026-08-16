@@ -59,7 +59,7 @@
 
 //high nibble SR flags, low nibble address mode
 const unsigned char flags[] PROGMEM = {
-	AD_IMP, AD_INDX, UNDF, UNDF, UNDF, FL_ZN|AD_ZPG, FL_ZNC|AD_ZPG, UNDF, AD_IMP, FL_ZN|AD_IMM, FL_ZNC|AD_A, UNDF, UNDF, FL_ZN|AD_ABS, FL_ZNC|AD_ABS, UNDF,
+	AD_IMP, FL_ZN|AD_INDX, UNDF, UNDF, UNDF, FL_ZN|AD_ZPG, FL_ZNC|AD_ZPG, UNDF, AD_IMP, FL_ZN|AD_IMM, FL_ZNC|AD_A, UNDF, UNDF, FL_ZN|AD_ABS, FL_ZNC|AD_ABS, UNDF,
 	AD_REL, FL_ZN|AD_INDY, UNDF, UNDF, UNDF, FL_ZN|AD_ZPGX, FL_ZNC|AD_ZPGX, UNDF, AD_IMP, FL_ZN|AD_ABSY, UNDF, UNDF, UNDF, FL_ZN|AD_ABSX, FL_ZNC|AD_ABSX, UNDF,
 	AD_ABS, FL_ZN|AD_INDX, UNDF, UNDF, FL_Z|AD_ZPG, FL_ZN|AD_ZPG, FL_ZNC|AD_ZPG, UNDF, AD_IMP, FL_ZN|AD_IMM, FL_ZNC|AD_A, UNDF, FL_Z|AD_ABS, FL_ZN|AD_ABS, FL_ZNC|AD_ABS, UNDF,
 	AD_REL, FL_ZN|AD_INDY, UNDF, UNDF, UNDF, FL_ZN|AD_ZPGX, FL_ZNC|AD_ZPGX, UNDF, AD_IMP, FL_ZN|AD_ABSY, UNDF, UNDF, UNDF, FL_ZN|AD_ABSX, FL_ZNC|AD_ABSX, UNDF,
@@ -132,6 +132,88 @@ static bool IsHandledCMOSOpcode(unsigned char op) {
   return (op & 0x0F) == 0x07 || (op & 0x0F) == 0x0F;
 }
 
+static unsigned char NMOSUndefinedAddressMode(unsigned char op) {
+  // Stable NMOS 6502 undocumented NOPs still fetch their operand bytes. Many
+  // Apple II loaders use $80 as a two-byte NOP; treating every undefined
+  // opcode as implied desynchronizes the instruction stream.
+  switch (op) {
+    // Stable undocumented read/modify/write families: SLO, RLA, SRE, RRA,
+    // DCP, and ISC all share the same seven addressing forms.
+    case 0x03: case 0x23: case 0x43: case 0x63: case 0xC3: case 0xE3: return AD_INDX;
+    case 0x07: case 0x27: case 0x47: case 0x67: case 0xC7: case 0xE7: return AD_ZPG;
+    case 0x0F: case 0x2F: case 0x4F: case 0x6F: case 0xCF: case 0xEF: return AD_ABS;
+    case 0x13: case 0x33: case 0x53: case 0x73: case 0xD3: case 0xF3: return AD_INDY;
+    case 0x17: case 0x37: case 0x57: case 0x77: case 0xD7: case 0xF7: return AD_ZPGX;
+    case 0x1B: case 0x3B: case 0x5B: case 0x7B: case 0xDB: case 0xFB: return AD_ABSY;
+    case 0x1F: case 0x3F: case 0x5F: case 0x7F: case 0xDF: case 0xFF: return AD_ABSX;
+    case 0x83: case 0xA3: return AD_INDX; // SAX/LAX
+    case 0x87: case 0xA7: return AD_ZPG;
+    case 0x8F: case 0xAF: return AD_ABS;
+    case 0x97: case 0xB7: return AD_ZPGY;
+    case 0xB3: return AD_INDY;
+    case 0xBF: return AD_ABSY;
+    case 0x0B: case 0x2B: case 0x4B: case 0x6B: case 0xCB: case 0xEB:
+      return AD_IMM;
+    case 0x80: case 0x82: case 0x89: case 0xC2: case 0xE2:
+      return AD_IMM;
+    case 0x04: case 0x44: case 0x64:
+      return AD_ZPG;
+    case 0x14: case 0x34: case 0x54: case 0x74: case 0xD4: case 0xF4:
+      return AD_ZPGX;
+    case 0x0C:
+      return AD_ABS;
+    case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:
+      return AD_ABSX;
+  }
+  return AD_IMP;
+}
+
+static unsigned char NMOSUndefinedCycles(unsigned char op) {
+  // The base table contains the NMOS timings for stable undocumented
+  // operations. NOPs below need explicit addressing-derived timings.
+  if (NMOSUndefinedAddressMode(op) != AD_IMP &&
+      op != 0x04 && op != 0x0C && op != 0x14 && op != 0x1C &&
+      op != 0x34 && op != 0x3C && op != 0x44 && op != 0x54 &&
+      op != 0x5C && op != 0x64 && op != 0x74 && op != 0x7C &&
+      op != 0x80 && op != 0x82 && op != 0x89 && op != 0xC2 &&
+      op != 0xD4 && op != 0xDC && op != 0xE2 && op != 0xF4 && op != 0xFC)
+    return pgm_read_byte_near(opcodeCycles + op);
+  switch (NMOSUndefinedAddressMode(op)) {
+    case AD_ZPG: return 3;
+    case AD_ZPGX: return 4;
+    case AD_ABS: return 4;
+    case AD_ABSX: return 4;
+    default: return 2;
+  }
+}
+
+static bool IsNMOSStableUndocumentedOpcode(unsigned char op) {
+  switch (op) {
+    case 0x03: case 0x07: case 0x0F: case 0x13: case 0x17: case 0x1B: case 0x1F:
+    case 0x23: case 0x27: case 0x2F: case 0x33: case 0x37: case 0x3B: case 0x3F:
+    case 0x43: case 0x47: case 0x4F: case 0x53: case 0x57: case 0x5B: case 0x5F:
+    case 0x63: case 0x67: case 0x6F: case 0x73: case 0x77: case 0x7B: case 0x7F:
+    case 0x83: case 0x87: case 0x8F: case 0x97:
+    case 0xA3: case 0xA7: case 0xAF: case 0xB3: case 0xB7: case 0xBF:
+    case 0xC3: case 0xC7: case 0xCF: case 0xD3: case 0xD7: case 0xDB: case 0xDF:
+    case 0xE3: case 0xE7: case 0xEF: case 0xF3: case 0xF7: case 0xFB: case 0xFF:
+    case 0x0B: case 0x2B: case 0x4B: case 0x6B: case 0xCB: case 0xEB:
+      return true;
+  }
+  return false;
+}
+
+static bool IsNMOSUndocumentedRMWOpcode(unsigned char op) {
+  unsigned char family = op & 0xE0;
+  if (family == 0x80 || family == 0xA0) return false;
+  switch (op & 0x1F) {
+    case 0x03: case 0x07: case 0x0F: case 0x13:
+    case 0x17: case 0x1B: case 0x1F:
+      return true;
+  }
+  return false;
+}
+
 static unsigned char CMOSAddressMode(unsigned char op) {
   switch (op) {
     case 0x04: case 0x14: case 0x64: return AD_ZPG;
@@ -192,6 +274,190 @@ void setflags() {
   if(opflags&0x20) SR |= (((result&0xFF) == 0)?0x02:0); //zero
   if(opflags&0x10) SR |= ((result&0xFF00)?0x01:0); //carry
   if(opflags&0x40) SR |= ((result^((unsigned short)A))&(result^value16)&0x0080)>>1; 
+}
+
+static unsigned char ExecuteADC(unsigned char operand) {
+  unsigned char accumulator = A;
+  unsigned char carryIn = (SR & SR_CARRY) ? 1 : 0;
+  unsigned short binary = (unsigned short) accumulator + operand + carryIn;
+  bool overflow = (~(accumulator ^ operand) & (accumulator ^ binary) & 0x80) != 0;
+
+  if (SR & SR_DEC) {
+    unsigned short adjusted = binary;
+    if ((accumulator & 0x0F) + (operand & 0x0F) + carryIn > 9)
+      adjusted += 0x06;
+    unsigned short lowAdjusted = adjusted;
+    if (adjusted > 0x99)
+      adjusted += 0x60;
+    A = adjusted & 0xFF;
+    SR &= ~(SR_CARRY | SR_ZERO | SR_OVER | SR_NEG);
+    if (adjusted > 0xFF) SR |= SR_CARRY;
+    if (overflow) SR |= SR_OVER;
+    if (Is65C02Mode()) {
+      if (A == 0) SR |= SR_ZERO;
+      if (A & 0x80) SR |= SR_NEG;
+    } else {
+      // NMOS 6502 N/Z reflect the binary/intermediate ALU result rather than
+      // the final BCD-adjusted accumulator.
+      if ((binary & 0xFF) == 0) SR |= SR_ZERO;
+      if (lowAdjusted & 0x80) SR |= SR_NEG;
+    }
+    return Is65C02Mode() ? 1 : 0;
+  }
+
+  value16 = operand;
+  result = binary;
+  setflags();
+  A = result & 0xFF;
+  return 0;
+}
+
+static unsigned char ExecuteSBC(unsigned char operand) {
+  unsigned char accumulator = A;
+  unsigned char carryIn = (SR & SR_CARRY) ? 1 : 0;
+  int binary = (int) accumulator - operand - (carryIn ? 0 : 1);
+  unsigned char binaryResult = binary & 0xFF;
+  bool overflow = ((accumulator ^ binaryResult) & (accumulator ^ operand) & 0x80) != 0;
+
+  if (SR & SR_DEC) {
+    int low = (accumulator & 0x0F) - (operand & 0x0F) - (carryIn ? 0 : 1);
+    int high = (accumulator >> 4) - (operand >> 4);
+    if (low < 0) {
+      low -= 6;
+      high--;
+    }
+    if (high < 0)
+      high -= 6;
+    A = ((high << 4) | (low & 0x0F)) & 0xFF;
+    SR &= ~(SR_CARRY | SR_ZERO | SR_OVER | SR_NEG);
+    if (binary >= 0) SR |= SR_CARRY;
+    if (overflow) SR |= SR_OVER;
+    unsigned char flagResult = Is65C02Mode() ? A : binaryResult;
+    if (flagResult == 0) SR |= SR_ZERO;
+    if (flagResult & 0x80) SR |= SR_NEG;
+    return Is65C02Mode() ? 1 : 0;
+  }
+
+  value16 = ((unsigned short) operand) ^ 0x00FF;
+  result = (unsigned short) accumulator + value16 + carryIn;
+  setflags();
+  A = result & 0xFF;
+  return 0;
+}
+
+static void SetNMOSZN(unsigned char value) {
+  SR &= ~(SR_ZERO | SR_NEG);
+  if (value == 0) SR |= SR_ZERO;
+  if (value & 0x80) SR |= SR_NEG;
+}
+
+static bool ExecuteNMOSStableUndocumented(unsigned char op,
+                                          unsigned char addressMode,
+                                          unsigned char &extraCycles) {
+  if (!IsNMOSStableUndocumentedOpcode(op)) return false;
+
+  bool zeroPage = addressMode == AD_ZPG || addressMode == AD_ZPGX ||
+                  addressMode == AD_ZPGY;
+  unsigned char operand = zeroPage ? readPgz8(argument_addr)
+                                   : read8(argument_addr);
+  unsigned char family = op & 0xE0;
+
+  // Combined read/modify/write operations. The memory modification happens
+  // first, followed by the accumulator operation using the modified byte.
+  if (IsNMOSUndocumentedRMWOpcode(op)) {
+    unsigned char modified = operand;
+    bool carryOut = false;
+    if (family == 0x00 || family == 0x20) {       // SLO / RLA
+      carryOut = (operand & 0x80) != 0;
+      modified = (operand << 1) | (family == 0x20 && (SR & SR_CARRY) ? 1 : 0);
+    } else if (family == 0x40 || family == 0x60) { // SRE / RRA
+      carryOut = (operand & 0x01) != 0;
+      modified = (operand >> 1) | (family == 0x60 && (SR & SR_CARRY) ? 0x80 : 0);
+    } else if (family == 0xC0) {                  // DCP
+      modified = operand - 1;
+    } else if (family == 0xE0) {                  // ISC
+      modified = operand + 1;
+    }
+
+    if (zeroPage) writePgz8(argument_addr, modified);
+    else write8(argument_addr, modified);
+
+    if (family == 0x00) {                         // SLO
+      A |= modified;
+      SR = (SR & ~SR_CARRY) | (carryOut ? SR_CARRY : 0);
+      SetNMOSZN(A);
+    } else if (family == 0x20) {                  // RLA
+      A &= modified;
+      SR = (SR & ~SR_CARRY) | (carryOut ? SR_CARRY : 0);
+      SetNMOSZN(A);
+    } else if (family == 0x40) {                  // SRE
+      A ^= modified;
+      SR = (SR & ~SR_CARRY) | (carryOut ? SR_CARRY : 0);
+      SetNMOSZN(A);
+    } else if (family == 0x60) {                  // RRA
+      SR = (SR & ~SR_CARRY) | (carryOut ? SR_CARRY : 0);
+      extraCycles += ExecuteADC(modified);
+    } else if (family == 0xC0) {                  // DCP
+      unsigned char difference = A - modified;
+      SR &= ~(SR_CARRY | SR_ZERO | SR_NEG);
+      if (A >= modified) SR |= SR_CARRY;
+      SetNMOSZN(difference);
+    } else {                                      // ISC
+      extraCycles += ExecuteSBC(modified);
+    }
+    return true;
+  }
+
+  switch (op) {
+    case 0x83: case 0x87: case 0x8F: case 0x97:   // SAX
+      if (zeroPage) writePgz8(argument_addr, A & X);
+      else write8(argument_addr, A & X);
+      return true;
+
+    case 0xA3: case 0xA7: case 0xAF:
+    case 0xB3: case 0xB7: case 0xBF:              // LAX
+      A = X = operand;
+      SetNMOSZN(A);
+      return true;
+
+    case 0x0B: case 0x2B:                         // ANC
+      A &= operand;
+      SetNMOSZN(A);
+      SR = (SR & ~SR_CARRY) | ((A & 0x80) ? SR_CARRY : 0);
+      return true;
+
+    case 0x4B: {                                  // ALR
+      unsigned char combined = A & operand;
+      SR = (SR & ~SR_CARRY) | ((combined & 1) ? SR_CARRY : 0);
+      A = combined >> 1;
+      SetNMOSZN(A);
+      return true;
+    }
+
+    case 0x6B: {                                  // ARR
+      unsigned char combined = A & operand;
+      A = (combined >> 1) | ((SR & SR_CARRY) ? 0x80 : 0);
+      SetNMOSZN(A);
+      SR &= ~(SR_CARRY | SR_OVER);
+      if (A & 0x40) SR |= SR_CARRY;
+      if (((A >> 6) ^ (A >> 5)) & 1) SR |= SR_OVER;
+      return true;
+    }
+
+    case 0xCB: {                                  // AXS/SBX immediate
+      unsigned char combined = A & X;
+      X = combined - operand;
+      SR &= ~SR_CARRY;
+      if (combined >= operand) SR |= SR_CARRY;
+      SetNMOSZN(X);
+      return true;
+    }
+
+    case 0xEB:                                    // unofficial SBC immediate
+      extraCycles += ExecuteSBC(operand);
+      return true;
+  }
+  return false;
 }
 
 /***************************************************************************************************************************************/
@@ -262,6 +528,9 @@ void execCode() {
         cmosUnhandledTraceCount++;
       }
 #endif
+    } else if (!Is65C02Mode() && baseOpcodeUndefined) {
+      opflags = NMOSUndefinedAddressMode(opcode);
+      instructionCycles = NMOSUndefinedCycles(opcode);
     }
 
     if (cmosBitBranch) {
@@ -360,8 +629,11 @@ void execCode() {
           case 0x51: case 0x59: case 0x5D:
           case 0x71: case 0x79: case 0x7D:
           case 0xB1: case 0xB9: case 0xBC: case 0xBD: case 0xBE:
+          case 0xB3: case 0xBF: // undocumented LAX
           case 0xD1: case 0xD9: case 0xDD:
           case 0xF1: case 0xF9: case 0xFD:
+          case 0x1C: case 0x3C: case 0x5C:
+          case 0x7C: case 0xDC: case 0xFC:
             instructionCycles++;
             break;
         }
@@ -370,6 +642,14 @@ void execCode() {
       // CMOS-only opcodes must never reach the 65C02 handlers while running
       // either NMOS profile. Previously an undefined NMOS $80 executed BRA
       // with a stale argument address and jumped into arbitrary memory.
+      if (!Is65C02Mode() && baseOpcodeUndefined &&
+          ExecuteNMOSStableUndocumented(opcode, opflags & 0x0F,
+                                        instructionCycles)) {
+        cycle += instructionCycles;
+        TotalCycles += instructionCycles;
+        return;
+      }
+
       if (!Is65C02Mode() && baseOpcodeUndefined) {
 #if ENABLE_CPU_TRACE
         if (IsHandledCMOSOpcode(opcode) && nmosCMOSOpcodeTraceCount < 16) {
@@ -400,10 +680,10 @@ void execCode() {
           if (opcode == 0x12) { result = A | value8; A = result; setflags(); }
           else if (opcode == 0x32) { result = A & value8; A = result; setflags(); }
           else if (opcode == 0x52) { result = A ^ value8; A = result; setflags(); }
-          else if (opcode == 0x72) { value16 = value8; result = A + value16 + (SR & SR_CARRY); setflags(); A = result; }
+          else if (opcode == 0x72) { instructionCycles += ExecuteADC(value8); }
           else if (opcode == 0xB2) { A = value8; result = A; setflags(); }
           else if (opcode == 0xD2) { value16 = ((unsigned short)value8) ^ 0xFF; result = A + value16 + 1; setflags(); }
-          else { value16 = ((unsigned short)value8) ^ 0xFF; result = A + value16 + (SR & SR_CARRY); setflags(); A = result; }
+          else { instructionCycles += ExecuteSBC(value8); }
           break;
         }
         case 0x92: write8(argument_addr, A); break; // STA (zp)
@@ -444,18 +724,12 @@ void execCode() {
         }
         //ADC
         case 0x65:
-          value16 = (unsigned short)readPgz8(argument_addr);
-          result = (unsigned short)A + value16 + (unsigned short)(SR&SR_CARRY);
-          setflags();
-          A = result&0xFF;
+          instructionCycles += ExecuteADC(readPgz8(argument_addr));
           break;
         case 0x69: case 0x75:
         case 0x6D: case 0x7D: case 0x79:
         case 0x61: case 0x71:
-          value16 = (unsigned short)read8(argument_addr);
-          result = (unsigned short)A + value16 + (unsigned short)(SR&SR_CARRY);
-          setflags();
-          A = result&0xFF;
+          instructionCycles += ExecuteADC(read8(argument_addr));
           break;
         //AND
         case 0x25: case 0x35:
@@ -866,18 +1140,12 @@ void execCode() {
         break;
       //SBC
       case 0xE5: case 0xF5:
-        value16 = ((unsigned short)readPgz8(argument_addr)) ^ 0x00FF;
-        result = (unsigned short)A + value16 + (unsigned short)(SR&SR_CARRY);
-        setflags();
-        A = result&0xFF;
+        instructionCycles += ExecuteSBC(readPgz8(argument_addr));
         break;
       case 0xE9: 
       case 0xED: case 0xFD: case 0xF9:
       case 0xE1: case 0xF1:
-        value16 = ((unsigned short)read8(argument_addr)) ^ 0x00FF;
-        result = (unsigned short)A + value16 + (unsigned short)(SR&SR_CARRY);
-        setflags();
-        A = result&0xFF;
+        instructionCycles += ExecuteSBC(read8(argument_addr));
         break;
       //SEC
       case 0x38:

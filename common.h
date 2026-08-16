@@ -59,6 +59,17 @@ void PaceSpeakerToEmulatedCycle();
 // CPU entry points required by the runtime task.
 void initCode();
 void execCode();
+void RunCPUValidationTests();
+void RunIIeBankingValidationTests();
+void RunKlausCPUValidationTests();
+void RunDiskIIValidationTests();
+void RunDiskOverlayValidationTests();
+unsigned char read8(unsigned short address);
+void write8(unsigned short address, unsigned char value);
+#if ENABLE_KLAUS_CPU_TEST
+extern bool CPUValidationFlatMemory;
+extern unsigned char * CPUValidationMemory;
+#endif
 void ResetMemorySoftSwitches();
 void InvalidateVideoCaches();
 extern bool iie80Column;
@@ -67,6 +78,12 @@ extern bool iieDoubleHires;
 unsigned char HostPaddleValue(int paddle);
 bool HostJoystickButton(int button);
 void PrintDiskRuntimeState();
+void CheckDiskLoaderSearch();
+void ResetDiskLoaderDiagnostics();
+extern volatile bool DiskHostIOActive;
+void PrintDiskHostIOState();
+bool ConsumeDiskFlushResume(uint32_t * transaction, unsigned long * elapsedMs);
+void ArmDiskPointerWatchpoint();
 void PrintIIeMemoryDiagnostic(unsigned short address);
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.

@@ -940,6 +940,10 @@ static void SetIIeSwitch(unsigned short address) {
 
 /***************************************************************************************************************************************/
 unsigned char readPgz8(unsigned short address) {
+#if ENABLE_KLAUS_CPU_TEST
+    if (CPUValidationFlatMemory)
+      return CPUValidationMemory[address];
+#endif
     return IIeUseAuxiliaryRAM(address, false) ? AUXRAM[address] : RAM[address];
 }
 
@@ -947,6 +951,10 @@ unsigned char readPgz8(unsigned short address) {
 
 /***************************************************************************************************************************************/
 unsigned char read8(unsigned short address) {
+#if ENABLE_KLAUS_CPU_TEST
+  if (CPUValidationFlatMemory)
+    return CPUValidationMemory[address];
+#endif
   unsigned char page = address>>8;
   if(page < 0xC0) {
     return IIeUseAuxiliaryRAM(address, false) ? AUXRAM[address] : RAM[address];
@@ -1031,6 +1039,12 @@ unsigned short read16(unsigned short address) {
 
 /***************************************************************************************************************************************/
 void writePgz8(unsigned short address, unsigned char value) {
+#if ENABLE_KLAUS_CPU_TEST
+    if (CPUValidationFlatMemory) {
+      CPUValidationMemory[address] = value;
+      return;
+    }
+#endif
     if (IIeUseAuxiliaryRAM(address, true)) AUXRAM[address] = value;
     else RAM[address] = value;
 }
@@ -1039,6 +1053,12 @@ void writePgz8(unsigned short address, unsigned char value) {
 
 /***************************************************************************************************************************************/
 void write8(unsigned short address, unsigned char value) {
+#if ENABLE_KLAUS_CPU_TEST
+  if (CPUValidationFlatMemory) {
+    CPUValidationMemory[address] = value;
+    return;
+  }
+#endif
   unsigned char page = address >> 8;
   if (page < 0xC0)
   {

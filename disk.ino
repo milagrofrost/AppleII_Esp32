@@ -20,6 +20,7 @@
 
 #include "common.h"
 #include "esp32-hal-psram.h"
+#include "esp_cpu.h"
 #include <dirent.h>
 #include <sys/stat.h>
 extern "C" {
@@ -47,12 +48,132 @@ static bool DriveDiskImageHeapAllocated[2] = { false, false };
 static char DriveSavePath[2][MAX_DISK_PATH + 16] = {{0}, {0}};
 char DiskLoadError[96] = "Disk image has not been loaded";
 char LoadedDiskName[64] = "";
+#if ENABLE_DISK_SECTOR_TRACE
 static unsigned int DiskReadTraceCount = 0;
+#endif
 static unsigned int DiskTrackTraceCount = 0;
+volatile bool DiskHostIOActive = false;
+static volatile uint32_t DiskHostIOTransaction = 0;
+static volatile unsigned long DiskHostIOStartedAt = 0;
+static volatile int DiskHostIODrive = -1;
+static volatile size_t DiskHostIOOffset = 0;
+static volatile size_t DiskHostIOSize = 0;
+static const char * volatile DiskHostIOOperation = "idle";
+static unsigned int DiskHostIODepth = 0;
+static volatile bool DiskFlushResumePending = false;
+static volatile uint32_t DiskFlushResumeTransaction = 0;
+static volatile unsigned long DiskFlushResumeElapsed = 0;
+static uint32_t DiskWriteSession = 0;
+static unsigned int DiskWriteSessionBytes = 0;
+static unsigned int DiskWriteTraceCount = 0;
+static unsigned char * DiskMountedBuffer[2] = { NULL, NULL };
+static bool DiskBufferCorruptionReported = false;
 #if ENABLE_DISK_DIAGNOSTICS
 static unsigned int DiskIOTraceCount = 0;
 static unsigned long DiskHeadPositionChangedAt = 0;
+
+// Timing-critical Disk II reads are captured in RAM. Serial output occurs
+// only after a prolonged, same-track loader search has been detected.
+struct DiskLoaderTraceEvent {
+  uint32_t cycle;
+  uint16_t pc;
+  uint16_t index;
+  uint16_t delta;
+  uint8_t address;
+  uint8_t latch;
+  uint8_t track;
+  uint8_t flags;
+};
+// Keep this in internal RAM: controller access is timing-critical and this
+// target has little linker-visible DRAM headroom. Forty-eight events cover
+// several complete custom-loader polling sequences.
+static const unsigned int DISK_LOADER_TRACE_SIZE = 48;
+static DiskLoaderTraceEvent DiskLoaderTrace[DISK_LOADER_TRACE_SIZE];
+static unsigned int DiskLoaderTraceIndex = 0;
+static uint32_t DiskLoaderLastAccessCycle = 0;
+static uint32_t DiskLoaderReadCount = 0;
+static uint32_t DiskLoaderWriteCount = 0;
+static uint32_t DiskLoaderCheckReadCount = 0;
+static uint32_t DiskLoaderCheckWriteCount = 0;
+static int DiskLoaderCheckDrive = -1;
+static int DiskLoaderCheckTrack = -1;
+static unsigned char DiskLoaderStagnantIntervals = 0;
+static bool DiskLoaderSnapshotDumped = false;
 #endif
+
+static uint32_t BeginDiskHostIO(const char * operation, int drive,
+                                size_t offset, size_t size) {
+  if (DiskHostIODepth++ == 0) {
+    DiskHostIOTransaction++;
+    DiskHostIOOperation = operation;
+    DiskHostIODrive = drive;
+    DiskHostIOOffset = offset;
+    DiskHostIOSize = size;
+    DiskHostIOStartedAt = millis();
+    DiskHostIOActive = true;
+    DEBUG_PRINTF("[HOSTIO] BEGIN transaction=%lu op=%s drive=%d offset=%u "
+                 "size=%u PC=%04X heartbeat=%lu\n",
+                 (unsigned long) DiskHostIOTransaction, operation, drive + 1,
+                 (unsigned) offset, (unsigned) size, PC,
+                 (unsigned long) CPUInstructionHeartbeat);
+  }
+  return DiskHostIOTransaction;
+}
+
+static unsigned long EndDiskHostIO(uint32_t transaction, bool success) {
+  if (!DiskHostIODepth)
+    return 0;
+  if (--DiskHostIODepth)
+    return millis() - DiskHostIOStartedAt;
+
+  unsigned long elapsed = millis() - DiskHostIOStartedAt;
+  DEBUG_PRINTF("[HOSTIO] END transaction=%lu op=%s drive=%d success=%d "
+               "elapsed=%lums PC=%04X heartbeat=%lu\n",
+               (unsigned long) transaction, DiskHostIOOperation,
+               DiskHostIODrive + 1, success, elapsed, PC,
+               (unsigned long) CPUInstructionHeartbeat);
+  DiskHostIOActive = false;
+  DiskHostIOOperation = "idle";
+  return elapsed;
+}
+
+void PrintDiskHostIOState() {
+  if (!DiskHostIOActive)
+    return;
+  DEBUG_PRINTF("[TASK] CPU HOST-IO-WAIT transaction=%lu op=%s drive=%d "
+               "offset=%u size=%u elapsed=%lums taskState=%d PC=%04X\n",
+               (unsigned long) DiskHostIOTransaction, DiskHostIOOperation,
+               DiskHostIODrive + 1, (unsigned) DiskHostIOOffset,
+               (unsigned) DiskHostIOSize, millis() - DiskHostIOStartedAt,
+               Task1 ? (int) eTaskGetState(Task1) : -1,
+               CPUInstructionStartPC);
+}
+
+bool ConsumeDiskFlushResume(uint32_t * transaction, unsigned long * elapsedMs) {
+  if (!DiskFlushResumePending)
+    return false;
+  if (transaction)
+    *transaction = DiskFlushResumeTransaction;
+  if (elapsedMs)
+    *elapsedMs = DiskFlushResumeElapsed;
+  DiskFlushResumePending = false;
+  return true;
+}
+
+void ArmDiskPointerWatchpoint() {
+#if ENABLE_DISK_POINTER_WATCHPOINT
+  // DriveDiskImage[0..1] and DiskImage occupy 12 bytes. Watch the enclosing
+  // aligned 16-byte block, which excludes the adjacent TotalCycles counter.
+  uintptr_t watchAddress = ((uintptr_t) &DriveDiskImage[0]) & ~(uintptr_t) 0x0F;
+  esp_err_t result = esp_cpu_set_watchpoint(0, (void *) watchAddress, 16,
+                                            ESP_WATCHPOINT_STORE);
+  DEBUG_PRINTF("[WATCH] disk-owner store watchpoint result=%d core=%d "
+               "address=%p size=16 owners=%p legacy=%p cycles=%p\n",
+               (int) result, xPortGetCoreID(), (void *) watchAddress,
+               (void *) &DriveDiskImage[0], (void *) &DiskImage,
+               (void *) &TotalCycles);
+#endif
+}
 
 static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
   if (drive < 0 || drive > 1 || !sourcePath ||
@@ -71,6 +192,10 @@ static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
     if (saveSize == (long) DISK_IMAGE_SIZE) {
       DEBUG_PRINTF("[DISK] drive %d loading writable save image %s\n",
                    drive + 1, DriveSavePath[drive]);
+      DEBUG_PRINTF("[HOSTIO] OVERLAY-READY drive=%d created=0 cpuTaskState=%d "
+                   "path=%s\n", drive + 1,
+                   Task1 ? (int) eTaskGetState(Task1) : -1,
+                   DriveSavePath[drive]);
       return DriveSavePath[drive];
     }
     DEBUG_PRINTF("[DISK] replacing invalid save image size=%ld path=%s\n",
@@ -80,6 +205,8 @@ static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
   // Create the copy-on-write base while emulation is stopped in the disk
   // selector. Runtime track flushes can then update only their 256-byte
   // sectors instead of blocking the CPU to write a complete image.
+  uint32_t hostTransaction = BeginDiskHostIO("overlay-create", drive, 0,
+                                             DISK_IMAGE_SIZE);
   FILE * source = fopen(sourcePath, "rb");
   save = source ? fopen(DriveSavePath[drive], "wb") : NULL;
   unsigned char * copyBuffer = save ? (unsigned char *) malloc(16384) : NULL;
@@ -103,6 +230,11 @@ static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
   if (copied == DISK_IMAGE_SIZE) {
     DEBUG_PRINTF("[DISK] drive %d prepared writable save image %s\n",
                  drive + 1, DriveSavePath[drive]);
+    unsigned long elapsed = EndDiskHostIO(hostTransaction, true);
+    DEBUG_PRINTF("[HOSTIO] OVERLAY-READY drive=%d created=1 elapsed=%lums "
+                 "cpuTaskState=%d path=%s\n", drive + 1, elapsed,
+                 Task1 ? (int) eTaskGetState(Task1) : -1,
+                 DriveSavePath[drive]);
     return DriveSavePath[drive];
   }
 
@@ -110,6 +242,7 @@ static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
   DEBUG_PRINTF("[DISK] unable to prepare writable save image; drive %d will be read-only\n",
                drive + 1);
   DriveSavePath[drive][0] = '\0';
+  EndDiskHostIO(hostTransaction, false);
   return sourcePath;
 }
 
@@ -637,12 +770,34 @@ static void FlashSelectedDiskRow(int selected) {
   int visibleRows = DiskMenuVisibleRows();
   int first = selected >= visibleRows ? selected - visibleRows + 1 : 0;
   int y = 60 + (selected - first) * 12;
-  for (int flash = 0; flash < 2; flash++) {
-    canvas.invertRectangle(20, y, canvas.getWidth() - 1, y + 8);
-    delay(75);
-    canvas.invertRectangle(20, y, canvas.getWidth() - 1, y + 8);
-    delay(75);
-  }
+  canvas.invertRectangle(20, y, canvas.getWidth() - 1, y + 8);
+  delay(50);
+  canvas.invertRectangle(20, y, canvas.getWidth() - 1, y + 8);
+}
+
+void DrawDiskLoadingStatus(int drive, const char * path) {
+  const char * name = path ? strrchr(path, '/') : NULL;
+  name = name ? name + 1 : (path ? path : "");
+
+  fabgl::Point savedOrigin = canvas.getOrigin();
+  canvas.setOrigin(0, 0);
+  canvas.setBrushColor(Color::Black);
+  canvas.clear();
+  DrawVGAAlignmentMarkers();
+
+  canvas.setPenColor(Color::BrightYellow);
+  char heading[32];
+  snprintf(heading, sizeof(heading), "LOADING DRIVE %d", drive + 1);
+  canvas.drawText(20, 62, heading);
+
+  canvas.setPenColor(Color::White);
+  char visibleName[36];
+  snprintf(visibleName, sizeof(visibleName), "%.35s", name);
+  canvas.drawText(20, 82, visibleName);
+  canvas.setPenColor(Color::BrightCyan);
+  canvas.drawText(20, 106, "PREPARING WRITABLE DISK...");
+  canvas.drawText(20, 122, "PLEASE WAIT");
+  canvas.setOrigin(savedOrigin);
 }
 
 static char DiskMenuScancodeToCharacter(int scanCode) {
@@ -651,6 +806,63 @@ static char DiskMenuScancodeToCharacter(int scanCode) {
   unsigned char appleKey = pgm_read_byte_near(scancode_to_apple + scanCode);
   char character = (char) (appleKey & 0x7F);
   return character >= 0x20 && character <= 0x7E ? character : 0;
+}
+
+static bool BuildDiskSavePath(const char * sourcePath, char * savePath,
+                              size_t savePathSize) {
+  return sourcePath && savePath && savePathSize &&
+         snprintf(savePath, savePathSize, "%s.sav.dsk", sourcePath) <
+           (int) savePathSize;
+}
+
+static bool DiskSaveFileExists(const char * savePath) {
+  FILE * save = savePath ? fopen(savePath, "rb") : NULL;
+  if (!save)
+    return false;
+  fclose(save);
+  return true;
+}
+
+static void DrawDeleteSaveConfirmation(int diskIndex) {
+  canvas.setBrushColor(Color::Black);
+  canvas.clear();
+  DrawVGAAlignmentMarkers();
+  canvas.setPenColor(Color::BrightRed);
+  canvas.drawText(20, 28, "DELETE WRITABLE SAVE?");
+  canvas.setPenColor(Color::White);
+  canvas.drawText(20, 52, "ORIGINAL DISK WILL NOT BE DELETED");
+  char visibleName[36];
+  snprintf(visibleName, sizeof(visibleName), "%.35s", DiskEntryName(diskIndex));
+  canvas.setPenColor(Color::BrightYellow);
+  canvas.drawText(20, 82, visibleName);
+  canvas.setPenColor(Color::BrightCyan);
+  canvas.drawText(20, 118, "PRESS Y TO DELETE");
+  canvas.drawText(20, 136, "PRESS N OR ESC TO CANCEL");
+}
+
+static bool DeleteDiskSaveFile(int diskIndex) {
+  char savePath[MAX_DISK_PATH + 16];
+  if (!BuildDiskSavePath(DiskEntryPath(diskIndex), savePath,
+                         sizeof(savePath))) {
+    DEBUG_PRINTF("[DISK] save path is too long; delete refused: %s\n",
+                 DiskEntryPath(diskIndex));
+    return false;
+  }
+  if (remove(savePath) != 0) {
+    DEBUG_PRINTF("[DISK] failed to delete save image %s\n", savePath);
+    return false;
+  }
+
+  // A runtime selector can delete media that is still mounted in the other
+  // drive. Keep its in-memory contents readable, but prevent a later flush
+  // from recreating the deleted overlay with stale data.
+  for (int drive = 0; drive < 2; drive++) {
+    if (DriveSavePath[drive][0] && strcmp(DriveSavePath[drive], savePath) == 0) {
+      DriveSavePath[drive][0] = '\0';
+    }
+  }
+  DEBUG_PRINTF("[DISK] deleted writable save image %s\n", savePath);
+  return true;
 }
 
 static void DrawDiskMenu(int selected) {
@@ -668,7 +880,7 @@ static void DrawDiskMenu(int selected) {
   canvas.setPenColor(Color::BrightYellow);
   canvas.drawText(20, 15, "APPLE II DISK SELECTOR");
   canvas.setPenColor(Color::White);
-  canvas.drawText(20, 30, "SEARCH  UP/DOWN  ENTER  TAB=MACHINE");
+  canvas.drawText(20, 30, "UP/DOWN ENTER TAB=MACHINE DEL=SAVE");
 
   canvas.setPenColor(Color::BrightCyan);
   char searchLine[48];
@@ -716,6 +928,8 @@ int SelectDiskImage() {
   int selected = 0;
   bool released = false;
   int exitScanCode = 0;
+  bool confirmingSaveDelete = false;
+  int saveDeleteDiskIndex = -1;
   DiskMenuSearch[0] = '\0';
   RebuildDiskMenuMatches();
   ResetDiskMenuMarquee();
@@ -749,6 +963,28 @@ int SelectDiskImage() {
       continue;
     }
 
+    if (confirmingSaveDelete) {
+      char confirmation = DiskMenuScancodeToCharacter(scanCode);
+      if (confirmation == 'Y') {
+        bool deleted = DeleteDiskSaveFile(saveDeleteDiskIndex);
+        canvas.setBrushColor(Color::Black);
+        canvas.clear();
+        DrawVGAAlignmentMarkers();
+        canvas.setPenColor(deleted ? Color::BrightGreen : Color::BrightRed);
+        canvas.drawText(20, 88, deleted ? "SAVE FILE DELETED" : "SAVE DELETE FAILED");
+        canvas.setPenColor(Color::White);
+        canvas.drawText(20, 108, deleted ? "NEXT LOAD STARTS CLEAN" : "CHECK SERIAL LOG");
+        delay(1000);
+        confirmingSaveDelete = false;
+        DrawDiskMenu(selected);
+      } else if (confirmation == 'N' || scanCode == 0x76) {
+        DEBUG_PRINTLN("[DISK] save deletion cancelled");
+        confirmingSaveDelete = false;
+        DrawDiskMenu(selected);
+      }
+      continue;
+    }
+
     if (scanCode == 0x0D) {
       AppleMachineProfile next = MachineProfile;
       bool changed = false;
@@ -764,6 +1000,22 @@ int SelectDiskImage() {
         delay(900);
       }
       DrawDiskMenu(selected);
+    } else if (scanCode == 0x71 && DiskMenuMatchCount > 0) {
+      saveDeleteDiskIndex = DiskMenuMatches[selected];
+      char savePath[MAX_DISK_PATH + 16];
+      if (!BuildDiskSavePath(DiskEntryPath(saveDeleteDiskIndex), savePath,
+                             sizeof(savePath)) ||
+          !DiskSaveFileExists(savePath)) {
+        canvas.setPenColor(Color::BrightYellow);
+        canvas.drawText(20, canvas.getHeight() - 28, "NO SAVE FILE FOR THIS DISK");
+        DEBUG_PRINTF("[DISK] no writable save image to delete for %s\n",
+                     DiskEntryPath(saveDeleteDiskIndex));
+        delay(900);
+        DrawDiskMenu(selected);
+      } else {
+        confirmingSaveDelete = true;
+        DrawDeleteSaveConfirmation(saveDeleteDiskIndex);
+      }
     } else if (scanCode == 0x75) {
       if (DiskMenuMatchCount) {
         selected = selected > 0 ? selected - 1 : DiskMenuMatchCount - 1;
@@ -851,6 +1103,7 @@ bool LoadBootDiskFromSD() {
   // selector is for attaching their data or second disk to drive 2.
   int selected = SelectDiskImage();
 
+  DrawDiskLoadingStatus(0, DiskEntryPath(selected));
   DEBUG_PRINTF("[SD] Selected %s\n", DiskEntryPath(selected));
   const char * bootImagePath = ConfigureDriveSavePath(0, DiskEntryPath(selected));
   FILE * imageFile = fopen(bootImagePath, "rb");
@@ -893,9 +1146,12 @@ bool LoadBootDiskFromSD() {
     return false;
   }
 
+  uint32_t hostTransaction = BeginDiskHostIO("boot-image-load", 0, 0,
+                                             DISK_IMAGE_SIZE);
   size_t bytesRead = ReadFileThroughInternalBuffer(imageFile, DiskImage,
                                                    DISK_IMAGE_SIZE, "boot disk");
   fclose(imageFile);
+  EndDiskHostIO(hostTransaction, bytesRead == DISK_IMAGE_SIZE);
   if (bytesRead != DISK_IMAGE_SIZE) {
     snprintf(DiskLoadError, sizeof(DiskLoadError), "Short read: %u of %u bytes", (unsigned) bytesRead, (unsigned) DISK_IMAGE_SIZE);
     DEBUG_PRINTF("[SD] ERROR: %s\n", DiskLoadError);
@@ -927,6 +1183,7 @@ bool LoadBootDiskFromSD() {
   DiskLoadError[0] = '\0';
   snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskEntryName(selected));
   DriveDiskImage[0] = DiskImage;
+  DiskMountedBuffer[0] = DiskImage;
   DriveDiskImageHeapAllocated[0] = !diskImageInPSRAM;
   DEBUG_PRINTF("[SD] Loaded %s into PSRAM (%u bytes)\n", LoadedDiskName, (unsigned) DISK_IMAGE_SIZE);
   return true;
@@ -1062,9 +1319,12 @@ bool LoadDiskImageForDrive(int drive, const char * path) {
     return false;
   }
 
+  uint32_t hostTransaction = BeginDiskHostIO("image-load", drive, 0,
+                                             DISK_IMAGE_SIZE);
   size_t bytesRead = ReadFileThroughInternalBuffer(imageFile, payload,
                                                    DISK_IMAGE_SIZE, "swapped disk");
   fclose(imageFile);
+  EndDiskHostIO(hostTransaction, bytesRead == DISK_IMAGE_SIZE);
 
   if (bytesRead != DISK_IMAGE_SIZE) {
     if (payloadHeapAllocated)
@@ -1082,7 +1342,10 @@ bool LoadDiskImageForDrive(int drive, const char * path) {
   DriveDiskImage[drive] = payload;
   DriveDiskImageHeapAllocated[drive] = payloadHeapAllocated;
   DrvSt[drive].DiskBuffer = payload;
+  DiskMountedBuffer[drive] = payload;
   DrvSt[drive].DiskSize = DISK_IMAGE_SIZE;
+  DrvSt[drive].DiskType = UnknownType;
+  DiskAutoID(&DrvSt[drive]);
   DrvSt[drive].WritePro = DriveSavePath[drive][0] ? 0 : 1;
   if (DrvSt[drive].Track > MAX_DISK_HALF_TRACK)
     DrvSt[drive].Track = MAX_DISK_HALF_TRACK;
@@ -1106,11 +1369,51 @@ void readSector(int drvAtivo, void * buf, size_t size) {
     driveBuffer = DiskImage;
   }
 
-  if (driveBuffer && SeekPos <= DISK_IMAGE_SIZE && size <= DISK_IMAGE_SIZE - SeekPos) {
+  bool intentionallyEmpty = drvAtivo >= 0 && drvAtivo < 2 &&
+                            !DrvSt[drvAtivo].DiskBuffer &&
+                            !DiskMountedBuffer[drvAtivo];
+  if (intentionallyEmpty) {
+    // No media produces no address/data prologues. Keep the raw track at its
+    // erased $FF state rather than synthesizing a formatted zero-filled disk.
+    memset(buf, 0xFF, size);
+  } else if (driveBuffer && SeekPos <= DISK_IMAGE_SIZE && size <= DISK_IMAGE_SIZE - SeekPos) {
     memcpy(buf, driveBuffer + SeekPos, size);
   } else {
     memset(buf, 0, size);
-    DEBUG_PRINTF("[DISK] ERROR: invalid read at %u (%u bytes)\n", SeekPos, (unsigned) size);
+    if (!DiskBufferCorruptionReported) {
+      DiskBufferCorruptionReported = true;
+      DEBUG_PRINTF("[DISK-CORRUPTION] FIRST invalid read driveArg=%d curDrive=%d "
+                   "offset=%u size=%u PC=%04X opcode=%02X heartbeat=%lu\n",
+                   drvAtivo + 1, CurDrv + 1, SeekPos, (unsigned) size,
+                   CPUInstructionStartPC, CPUInstructionOpcode,
+                   (unsigned long) CPUInstructionHeartbeat);
+      DEBUG_PRINTF("[DISK-CORRUPTION] pointers selected=%p mounted=%p "
+                   "drv0=%p drv1=%p owner0=%p owner1=%p legacy=%p\n",
+                   driveBuffer,
+                   (drvAtivo >= 0 && drvAtivo < 2) ? DiskMountedBuffer[drvAtivo] : NULL,
+                   DrvSt[0].DiskBuffer, DrvSt[1].DiskBuffer,
+                   DriveDiskImage[0], DriveDiskImage[1], DiskImage);
+      DEBUG_PRINTF("[DISK-CORRUPTION] state drive0 type=%d size=%ld wp=%d "
+                   "track=%d phase=%d active=%d old=%d dirty=%d; "
+                   "drive1 type=%d size=%ld wp=%d track=%d\n",
+                   (int) DrvSt[0].DiskType, DrvSt[0].DiskSize,
+                   DrvSt[0].WritePro, DrvSt[0].Track, DrvSt[0].Phase,
+                   DrvSt[0].Active, DrvSt[0].TrkBufOld,
+                   DrvSt[0].TrkBufChanged, (int) DrvSt[1].DiskType,
+                   DrvSt[1].DiskSize, DrvSt[1].WritePro, DrvSt[1].Track);
+      DEBUG_PRINT("[DISK-CORRUPTION] recent CPU:");
+      for (int historyOffset = 0; historyOffset < 16; historyOffset++) {
+        unsigned char historyIndex = (CPURecentIndex + historyOffset) & 0x0F;
+        DEBUG_PRINTF(" %04X:%02X@%04X", CPURecentPC[historyIndex],
+                     CPURecentOpcode[historyIndex],
+                     CPURecentArgument[historyIndex]);
+      }
+      DEBUG_PRINTLN();
+    }
+    DEBUG_PRINTF("[DISK] ERROR: invalid read drive=%d at %u (%u bytes) "
+                 "buffer=%p expected=%p\n", drvAtivo + 1, SeekPos,
+                 (unsigned) size, driveBuffer,
+                 (drvAtivo >= 0 && drvAtivo < 2) ? DiskMountedBuffer[drvAtivo] : NULL);
   }
 
 }
@@ -1134,11 +1437,14 @@ static bool PersistDriveRange(int drive, size_t offset, size_t size) {
       offset > DISK_IMAGE_SIZE || size > DISK_IMAGE_SIZE - offset)
     return false;
 
+  uint32_t hostTransaction = BeginDiskHostIO("sector-persist", drive,
+                                             offset, size);
   FILE * save = fopen(DriveSavePath[drive], "r+b");
   if (!save) {
     DrvSt[drive].WritePro = 1;
     DEBUG_PRINTF("[DISK] ERROR opening save image; drive %d is now write-protected: %s\n",
                  drive + 1, DriveSavePath[drive]);
+    EndDiskHostIO(hostTransaction, false);
     return false;
   }
 
@@ -1151,6 +1457,12 @@ static bool PersistDriveRange(int drive, size_t offset, size_t size) {
     DEBUG_PRINTF("[DISK] ERROR persisting save; drive %d is now write-protected: %s\n",
                  drive + 1, DriveSavePath[drive]);
   }
+  DEBUG_PRINTF("[DISK-SAVE] transaction=%lu drive=%d track=%u offset=%u "
+               "size=%u success=%d\n",
+               (unsigned long) hostTransaction, drive + 1,
+               (unsigned) (offset / 4096U), (unsigned) offset,
+               (unsigned) size, persisted);
+  EndDiskHostIO(hostTransaction, persisted);
   return persisted;
 }
 
@@ -1260,6 +1572,7 @@ void GotoHardSector(struct DriveState * ds, int sector) {
   if (ds -> DiskType == XgsType) /* currently only PO 2MG supported */ {
     lseekDisk(ds -> DiskFH, 256L * (long) ProDOSSkew[sector] + 64, SEEK_CUR);
   }
+#if ENABLE_DISK_SECTOR_TRACE
   if (DiskReadTraceCount < 24) {
     DEBUG_PRINTF("[DISK] sector read #%u time=%lums drive=%d track=%d logical=%d offset=%u type=%d\n",
                  DiskReadTraceCount + 1, millis(),
@@ -1267,6 +1580,7 @@ void GotoHardSector(struct DriveState * ds, int sector) {
                  sector, SeekPos, (int) ds -> DiskType);
     DiskReadTraceCount++;
   }
+#endif
 }
 
 /***************************************************************************************************************************************/
@@ -1394,6 +1708,19 @@ void ReadTrack(struct DriveState * ds) {
   /* Make sure that any unused part of the buffer has 0xff's in it */
   for (idx = 0; idx < 0x1a00; idx++) {
     TrackBuffer[idx] = 0xff;
+  }
+  if (!ds -> DiskBuffer) {
+    // An empty drive has no sector headers to nibblize. Leaving the raw track
+    // as $FF lets software time out/probe write protection as it would with
+    // no inserted disk, without fabricating readable sectors.
+    ds -> TrkBufChanged = 0;
+    ds -> TrkBufOld = 0;
+    ds -> ShouldRecal = 0;
+    if (traceTrackBuild) {
+      DEBUG_PRINTF("[DISK] empty drive=%d track=%d ready as no-media stream\n",
+                   (int) (ds - DrvSt) + 1, ds -> Track >> 1);
+    }
+    return;
   }
   if (ds -> DiskType == RawType) {
     /* Disk ][ track/byte format (0x1a00 bytes/track) - just read the bytes */
@@ -1540,6 +1867,12 @@ void DeNibbliseTrack(struct DriveState * ds) {
 void WriteTrack(struct DriveState * ds) {
   int idx;
   int drive = (int) (ds - DrvSt);
+  uint32_t hostTransaction = BeginDiskHostIO("track-flush", drive,
+    (size_t) (ds -> Track >> 1) *
+      (ds -> DiskType == RawType ? 0x1a00U : 4096U),
+    ds -> DiskType == RawType ? 0x1a00U : 4096U);
+  unsigned long flushStartedAt = millis();
+  bool persisted = true;
 
   /* fill any unused space in buffer with 0xff's */
   if (TrackBufLen < 0x1a00) {
@@ -1552,18 +1885,33 @@ void WriteTrack(struct DriveState * ds) {
     /* Disk ][ track/byte format (0x1a00 bytes/track) - just write the bytes */
     lseekDisk(ds -> DiskFH, (long)(ds -> Track >> 1) * 0x1a00L, SEEK_SET);
     writeSector((int) (ds - DrvSt), TrackBuffer, 0x1a00);
-    PersistDriveRange(drive, (size_t) (ds -> Track >> 1) * 0x1a00, 0x1a00);
+    persisted = PersistDriveRange(drive,
+      (size_t) (ds -> Track >> 1) * 0x1a00, 0x1a00);
   }
   if (ds -> DiskType == DOSType || ds -> DiskType == ProDOSType ||
     ds -> DiskType == SimsysType || ds -> DiskType == XgsType) {
     /* Track/sector format (4096 bytes/track) - translate from Disk ][ format */
     DeNibbliseTrack(ds);
-    PersistDriveRange(drive, (size_t) (ds -> Track >> 1) * 4096, 4096);
+    persisted = PersistDriveRange(drive,
+      (size_t) (ds -> Track >> 1) * 4096, 4096);
   }
   ds -> DiskSize = FileSize(ds -> DiskFH);
   if (ds -> DiskSize < 143360) ds -> DiskSize = 143360; // uso. 2002.1109
   /* track has been saved - so clear changed flag */
   ds -> TrkBufChanged = 0;
+  unsigned long flushElapsed = EndDiskHostIO(hostTransaction, persisted);
+  DEBUG_PRINTF("[DISK-FLUSH] transaction=%lu writeSession=%lu writeBytes=%u "
+               "drive=%d track=%d type=%d success=%d elapsed=%lums "
+               "dirtyAfter=%d\n",
+               (unsigned long) hostTransaction,
+               (unsigned long) DiskWriteSession, DiskWriteSessionBytes,
+               drive + 1, ds -> Track >> 1, (int) ds -> DiskType, persisted,
+               millis() - flushStartedAt, ds -> TrkBufChanged);
+  if (Task1 && xTaskGetCurrentTaskHandle() == Task1) {
+    DiskFlushResumeTransaction = hostTransaction;
+    DiskFlushResumeElapsed = flushElapsed;
+    DiskFlushResumePending = true;
+  }
 }
 
 /***************************************************************************************************************************************/
@@ -1581,6 +1929,110 @@ void PrintDiskRuntimeState() {
                ds->TrkBufOld, ds->Writing);
 }
 
+#if ENABLE_DISK_DIAGNOSTICS
+static void RecordDiskControllerAccess(word address, const DriveState * ds) {
+  unsigned int slot = DiskLoaderTraceIndex++ % DISK_LOADER_TRACE_SIZE;
+  DiskLoaderTraceEvent * event = &DiskLoaderTrace[slot];
+  uint32_t accessCycle = cycle;
+  uint32_t delta = accessCycle - DiskLoaderLastAccessCycle;
+  DiskLoaderLastAccessCycle = accessCycle;
+  event->cycle = accessCycle;
+  event->pc = CPUInstructionStartPC;
+  event->index = TrkBufIdx;
+  event->delta = delta > 0xFFFFUL ? 0xFFFF : (uint16_t) delta;
+  event->address = address & 0x0F;
+  event->latch = DataLatch;
+  event->track = ds->Track;
+  event->flags = (ds->ReadWP ? 0x01 : 0) |
+                 (ds->Writing ? 0x02 : 0) |
+                 (ds->Active ? 0x04 : 0) |
+                 (WriteAccess ? 0x08 : 0) |
+                 (DataLatch & 0x80 ? 0x10 : 0);
+
+  // C0EC is the normal Q6-low data-latch read used by custom loaders.
+  if (!WriteAccess && (address & 0x0F) == 0x0C &&
+      !ds->Writing && !ds->ReadWP)
+    DiskLoaderReadCount++;
+  if (WriteAccess || ds->Writing)
+    DiskLoaderWriteCount++;
+}
+
+static void DumpDiskLoaderSnapshot(uint32_t readsSinceCheck) {
+  DriveState * ds = &DrvSt[CurDrv];
+  DEBUG_PRINTF("[DISK-SEARCH] PROLONGED loader search drive=%d track=%d "
+               "readsWindow=%lu readsTotal=%lu writesTotal=%lu PC=%04X "
+               "idx=%u latch=%02X q6=%d q7=%d motor=%d cycle=%lu\n",
+               CurDrv + 1, ds->Track, (unsigned long) readsSinceCheck,
+               (unsigned long) DiskLoaderReadCount,
+               (unsigned long) DiskLoaderWriteCount, CPUInstructionStartPC,
+               TrkBufIdx, DataLatch, ds->ReadWP, ds->Writing, ds->Active,
+               cycle);
+  DEBUG_PRINTLN("[DISK-SEARCH] trace format: cycle:PC addr delta idx latch track flags(q6,q7,motor,write,high)");
+  unsigned int available = DiskLoaderTraceIndex < DISK_LOADER_TRACE_SIZE
+                         ? DiskLoaderTraceIndex : DISK_LOADER_TRACE_SIZE;
+  unsigned int first = DiskLoaderTraceIndex - available;
+  for (unsigned int offset = 0; offset < available; offset++) {
+    DiskLoaderTraceEvent * event =
+      &DiskLoaderTrace[(first + offset) % DISK_LOADER_TRACE_SIZE];
+    DEBUG_PRINTF("[DISK-TRACE] %lu:%04X C0E%X +%u idx=%u data=%02X "
+                 "trk=%u flags=%02X\n",
+                 (unsigned long) event->cycle, event->pc, event->address,
+                 event->delta, event->index, event->latch, event->track,
+                 event->flags);
+  }
+}
+#endif
+
+void ResetDiskLoaderDiagnostics() {
+#if ENABLE_DISK_DIAGNOSTICS
+  memset(DiskLoaderTrace, 0, sizeof(DiskLoaderTrace));
+  DiskLoaderTraceIndex = 0;
+  DiskLoaderLastAccessCycle = cycle;
+  DiskLoaderReadCount = 0;
+  DiskLoaderWriteCount = 0;
+  DiskLoaderCheckReadCount = 0;
+  DiskLoaderCheckWriteCount = 0;
+  DiskLoaderCheckDrive = -1;
+  DiskLoaderCheckTrack = -1;
+  DiskLoaderStagnantIntervals = 0;
+  DiskLoaderSnapshotDumped = false;
+#endif
+}
+
+void CheckDiskLoaderSearch() {
+#if ENABLE_DISK_DIAGNOSTICS
+  DriveState * ds = &DrvSt[CurDrv];
+  uint32_t readsSinceCheck = DiskLoaderReadCount - DiskLoaderCheckReadCount;
+  uint32_t writesSinceCheck = DiskLoaderWriteCount - DiskLoaderCheckWriteCount;
+  bool samePosition = DiskLoaderCheckDrive == CurDrv &&
+                      DiskLoaderCheckTrack == ds->Track;
+  bool searchHeavy = ds->Active && !ds->Writing && !ds->ReadWP &&
+                     samePosition && writesSinceCheck == 0 &&
+                     readsSinceCheck >= 10000;
+
+  if (searchHeavy) {
+    if (DiskLoaderStagnantIntervals < 0xFF)
+      DiskLoaderStagnantIntervals++;
+  } else {
+    DiskLoaderStagnantIntervals = 0;
+    if (!ds->Active || writesSinceCheck || !samePosition)
+      DiskLoaderSnapshotDumped = false;
+  }
+
+  // Task telemetry invokes this every ten seconds. Three consecutive
+  // read-heavy intervals on one track is a loader search, not normal latency.
+  if (DiskLoaderStagnantIntervals >= 3 && !DiskLoaderSnapshotDumped) {
+    DiskLoaderSnapshotDumped = true;
+    DumpDiskLoaderSnapshot(readsSinceCheck);
+  }
+
+  DiskLoaderCheckReadCount = DiskLoaderReadCount;
+  DiskLoaderCheckWriteCount = DiskLoaderWriteCount;
+  DiskLoaderCheckDrive = CurDrv;
+  DiskLoaderCheckTrack = ds->Track;
+#endif
+}
+
 // A media selector can leave the Disk II motor logically active while the CPU
 // is paused for several seconds.  Start the replacement disk at a clean
 // rotational timestamp so its first controller access never inherits timing
@@ -1590,6 +2042,7 @@ void ResetDiskRotationTiming() {
   LastIO = cycle;
   RotationCycleRemainder = 0;
   TrkBufIdx = 0;
+  ResetDiskLoaderDiagnostics();
 }
 
 /***************************************************************************************************************************************/
@@ -1751,7 +2204,9 @@ byte ReadDiskIO(word Address) {
   case 0x0f:
     if (ds -> TrkBufOld && ds -> Track % 2 == 0) {
       ReadTrack(ds);
-      TrkBufIdx = 0;
+      // The disk keeps spinning while the head moves. Rebuilding the new
+      // track must not snap rotational phase back to its first nibble.
+      RangeCheckTBI(&TrkBufIdx);
     }
     /* handle switch changes first */
     switch (Address & 0x0f) {
@@ -1776,6 +2231,17 @@ byte ReadDiskIO(word Address) {
           Diff = 32L;
           LeftOverCycles = 0L;
         }
+#if ENABLE_DISK_DIAGNOSTICS
+        if (DiskWriteTraceCount < 64) {
+          DEBUG_PRINTF("[DISK-WRITE] END session=%lu drive=%d track=%d "
+                       "bytes=%u dirty=%d idx=%u cycle=%lu PC=%04X\n",
+                       (unsigned long) DiskWriteSession, CurDrv + 1,
+                       ds -> Track >> 1, DiskWriteSessionBytes,
+                       ds -> TrkBufChanged, TrkBufIdx, cycle,
+                       CPUInstructionStartPC);
+          DiskWriteTraceCount++;
+        }
+#endif
       }
       ds -> Writing = 0;
       break;
@@ -1786,6 +2252,18 @@ byte ReadDiskIO(word Address) {
            read will be (partially) overwritten. Overwrite the whole
            lot. */
         LeftOverCycles = 0L;
+        DiskWriteSession++;
+        DiskWriteSessionBytes = 0;
+#if ENABLE_DISK_DIAGNOSTICS
+        if (DiskWriteTraceCount < 64) {
+          DEBUG_PRINTF("[DISK-WRITE] BEGIN session=%lu drive=%d track=%d "
+                       "wp=%d idx=%u cycle=%lu PC=%04X\n",
+                       (unsigned long) DiskWriteSession, CurDrv + 1,
+                       ds -> Track >> 1, ds -> WritePro, TrkBufIdx,
+                       cycle, CPUInstructionStartPC);
+          DiskWriteTraceCount++;
+        }
+#endif
       }
       ds -> Writing = 1;
       break;
@@ -1812,6 +2290,17 @@ byte ReadDiskIO(word Address) {
         RangeCheckTBI( & TrkBufIdx);
         TrackBuffer[TrkBufIdx] = DataLatch;
         ds -> TrkBufChanged = 1;
+        DiskWriteSessionBytes++;
+#if ENABLE_DISK_DIAGNOSTICS
+        if (DiskWriteSessionBytes == 1 && DiskWriteTraceCount < 64) {
+          DEBUG_PRINTF("[DISK-WRITE] DATA session=%lu drive=%d track=%d "
+                       "idx=%u latch=%02X cycle=%lu PC=%04X\n",
+                       (unsigned long) DiskWriteSession, CurDrv + 1,
+                       ds -> Track >> 1, TrkBufIdx, DataLatch, cycle,
+                       CPUInstructionStartPC);
+          DiskWriteTraceCount++;
+        }
+#endif
       }
     } else {
       /* read */
@@ -1820,12 +2309,17 @@ byte ReadDiskIO(word Address) {
         DataLatch = ds -> WritePro ? 0xff : 0x00;
       } else {
         /* read disk byte */
-        if (Diff >= 32L) {
+        // A complete encoded nibble is available every 32 emulated cycles.
+        // Returning guessed partial bits here caused custom loaders to accept
+        // corrupt bytes and later execute invalid language-card code. Until a
+        // bit-accurate sequencer exists, retain the earlier compatible model:
+        // the latch reads as zero between complete high-bit nibbles.
+        if (Diff < 32L) {
+          DataLatch = 0;
+        } else {
           RangeCheckTBI( & TrkBufIdx);
           DataLatch = TrackBuffer[TrkBufIdx];
           LastIO = cycle - LeftOverCycles;
-        } else {
-          DataLatch = 0;
         }
       }
     }
@@ -1869,6 +2363,10 @@ byte ReadDiskIO(word Address) {
     ds -> TrkBufOld = 1;
   }
 
+#if ENABLE_DISK_DIAGNOSTICS
+  if ((Address & 0x0F) >= 0x0C)
+    RecordDiskControllerAccess(Address, ds);
+#endif
   return DataLatch;
 }
 
@@ -1915,6 +2413,23 @@ void MountDisk(int disk) {
 
   ds = & DrvSt[disk];
 
+  if (!ds -> DiskBuffer) {
+    ds -> DiskFH = -1;
+    ds -> DiskSize = 0;
+    ds -> DiskType = UnknownType;
+    ds -> WritePro = 1;
+    ds -> TrkBufChanged = 0;
+    ds -> TrkBufOld = 1;
+    ds -> ShouldRecal = 1;
+    ds -> Track = 0;
+    ds -> Phase = 0;
+    ds -> ReadWP = 0;
+    ds -> Active = 0;
+    ds -> Writing = 0;
+    DEBUG_PRINTF("[DISK] mounted drive=%d empty writeProtected=1\n", disk + 1);
+    return;
+  }
+
   /* open disk file and set disk parameters */
   attr = GetAttrib(ds -> DiskFN);
   if (attr == 0xffff) {
@@ -1950,11 +2465,13 @@ void InitDisk(int slot) {
 
   // drive 1 is the OS/boot image host slot
   DrvSt[0].DiskBuffer = DriveDiskImage[0] ? DriveDiskImage[0] : DiskImage;
+  DiskMountedBuffer[0] = DrvSt[0].DiskBuffer;
   DrvSt[0].DiskType = UnknownType;
   MountDisk(0);
 
   // drive 2 remains an attachable runtime slot for host-level image swaps
   DrvSt[1].DiskBuffer = DriveDiskImage[1] ? DriveDiskImage[1] : NULL;
+  DiskMountedBuffer[1] = DrvSt[1].DiskBuffer;
   DrvSt[1].DiskType = UnknownType;
   MountDisk(1);
 
@@ -1964,4 +2481,5 @@ void InitDisk(int slot) {
 #if ENABLE_DISK_DIAGNOSTICS
   DiskHeadPositionChangedAt = millis();
 #endif
+  ResetDiskLoaderDiagnostics();
 }

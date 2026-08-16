@@ -49,6 +49,7 @@ static bool HostCtrlDown = false;
 static bool HostAltDown = false;
 static bool HostDeleteDown = false;
 static bool HostSwapKeyActive = false;
+static unsigned char HostSwapScanCode = 0;
 static bool HostBreakPending = false;
 static bool HostExtendedPending = false;
 static volatile bool HostLeftDown = false, HostRightDown = false;
@@ -100,6 +101,7 @@ static void HostDiskManagerTrigger() {
   }
 
   int selected = SelectDiskImage();
+  DrawDiskLoadingStatus(0, DiskEntryPath(selected));
   DEBUG_PRINTF("[HOST] Cold boot drive 1 from %s\n", DiskEntryPath(selected));
 
   if (LoadDiskImageForDrive(0, DiskEntryPath(selected))) {
@@ -151,6 +153,7 @@ static void HostDrive1SwapTrigger() {
   }
 
   int selected = SelectDiskImage();
+  DrawDiskLoadingStatus(0, DiskEntryPath(selected));
   DEBUG_PRINTF("[HOST] Hot-swapping drive 1 to %s\n", DiskEntryPath(selected));
   if (LoadDiskImageForDrive(0, DiskEntryPath(selected))) {
     snprintf(LoadedDiskName, sizeof(LoadedDiskName), "%s", DiskEntryName(selected));
@@ -165,6 +168,40 @@ static void HostDrive1SwapTrigger() {
                  LoadedDiskName, PC);
   } else {
     DEBUG_PRINTF("[HOST] drive 1 media swap failed: %s\n", DiskLoadError);
+  }
+
+  if (Task1 != NULL)
+    vTaskResume(Task1);
+}
+
+static void HostDrive2InsertTrigger() {
+  DEBUG_PRINTLN("[HOST] Ctrl+Alt+D requested: pausing for drive-2 media insert");
+
+  if (Task1 != NULL)
+    vTaskSuspend(Task1);
+
+  FindDiskImages();
+  if (DiskMenuCount == 0) {
+    DEBUG_PRINTLN("[HOST] No indexed disk images are available for drive 2");
+    if (Task1 != NULL)
+      vTaskResume(Task1);
+    return;
+  }
+
+  int selected = SelectDiskImage();
+  DrawDiskLoadingStatus(1, DiskEntryPath(selected));
+  DEBUG_PRINTF("[HOST] Inserting drive-2 media %s\n", DiskEntryPath(selected));
+  if (LoadDiskImageForDrive(1, DiskEntryPath(selected))) {
+    ResetDiskRotationTiming();
+    InvalidateVideoCaches();
+    canvas.setBrushColor(Color::Black);
+    canvas.clear();
+    DrawVGAAlignmentMarkers();
+    DEBUG_PRINTF("[HOST] drive 2 media inserted without reset: %s PC=%04X\n",
+                 DiskEntryName(selected), PC);
+  } else {
+    DEBUG_PRINTF("[HOST] drive 2 media insert failed: %s (%s)\n",
+                 DiskEntryPath(selected), DiskLoadError);
   }
 
   if (Task1 != NULL)
@@ -198,7 +235,7 @@ void keyboard_In(int keyPush) {
       HostButton0Down = keyDown;
     }
 
-    if (keyPush == 0x1B && HostSwapKeyActive) {
+    if (keyPush == HostSwapScanCode && HostSwapKeyActive) {
       if (!keyDown)
         HostSwapKeyActive = false;
       keyboard_mbyte = 0;
@@ -207,7 +244,19 @@ void keyboard_In(int keyPush) {
 
     if (keyDown && keyPush == 0x1B && HostCtrlDown && HostAltDown) {
       HostSwapKeyActive = true;
+      HostSwapScanCode = keyPush;
       HostDrive1SwapTrigger();
+      keyboard_mbyte = 0;
+      keyboard_data[0] = keyboard_data[1] = keyboard_data[2] = 0;
+      return;
+    }
+
+    // PS/2 set-2 scan code $23 is D. Insert/select drive-2 media while
+    // preserving drive 1 and the complete emulated machine state.
+    if (keyDown && keyPush == 0x23 && HostCtrlDown && HostAltDown) {
+      HostSwapKeyActive = true;
+      HostSwapScanCode = keyPush;
+      HostDrive2InsertTrigger();
       keyboard_mbyte = 0;
       keyboard_data[0] = keyboard_data[1] = keyboard_data[2] = 0;
       return;
