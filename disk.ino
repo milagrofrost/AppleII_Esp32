@@ -176,6 +176,15 @@ void ArmDiskPointerWatchpoint() {
 }
 
 static const char * ConfigureDriveSavePath(int drive, const char * sourcePath) {
+  static bool diskWriteABModeLogged = false;
+  if (!diskWriteABModeLogged) {
+    diskWriteABModeLogged = true;
+#if DISK_WRITE_AB_MODE == DISK_WRITE_AB_READ_ONLY
+    DEBUG_PRINTLN("[DISK-AB] mode=B overlay=preserved guestWrites=disabled persistence=disabled");
+#else
+    DEBUG_PRINTLN("[DISK-AB] mode=A overlay=preserved guestWrites=enabled persistence=enabled");
+#endif
+  }
   if (drive < 0 || drive > 1 || !sourcePath ||
       snprintf(DriveSavePath[drive], sizeof(DriveSavePath[drive]),
                "%s.sav.dsk", sourcePath) >= (int) sizeof(DriveSavePath[drive])) {
@@ -1422,6 +1431,12 @@ void readSector(int drvAtivo, void * buf, size_t size) {
 
 /***************************************************************************************************************************************/
 void writeSector(int drvAtivo, void * buf, size_t size) {
+#if DISK_WRITE_AB_MODE == DISK_WRITE_AB_READ_ONLY
+  (void) drvAtivo;
+  (void) buf;
+  (void) size;
+  return;
+#else
   if (drvAtivo < 0 || drvAtivo > 1 || DrvSt[drvAtivo].WritePro ||
       !DrvSt[drvAtivo].DiskBuffer || !DriveSavePath[drvAtivo][0] ||
       SeekPos > DISK_IMAGE_SIZE || size > DISK_IMAGE_SIZE - SeekPos)
@@ -1429,9 +1444,16 @@ void writeSector(int drvAtivo, void * buf, size_t size) {
 
   unsigned char * driveBuffer = DrvSt[drvAtivo].DiskBuffer;
   memcpy(driveBuffer + SeekPos, buf, size);
+#endif
 }
 
 static bool PersistDriveRange(int drive, size_t offset, size_t size) {
+#if DISK_WRITE_AB_MODE == DISK_WRITE_AB_READ_ONLY
+  (void) drive;
+  (void) offset;
+  (void) size;
+  return false;
+#else
   if (drive < 0 || drive > 1 || DrvSt[drive].WritePro ||
       !DrvSt[drive].DiskBuffer || !DriveSavePath[drive][0] ||
       offset > DISK_IMAGE_SIZE || size > DISK_IMAGE_SIZE - offset)
@@ -1464,6 +1486,7 @@ static bool PersistDriveRange(int drive, size_t offset, size_t size) {
                (unsigned) size, persisted);
   EndDiskHostIO(hostTransaction, persisted);
   return persisted;
+#endif
 }
 
 /***************************************************************************************************************************************/
@@ -1865,6 +1888,14 @@ void DeNibbliseTrack(struct DriveState * ds) {
 
 /***************************************************************************************************************************************/
 void WriteTrack(struct DriveState * ds) {
+#if DISK_WRITE_AB_MODE == DISK_WRITE_AB_READ_ONLY
+  if (ds -> TrkBufChanged) {
+    DEBUG_PRINTF("[DISK-AB] suppressed dirty-track flush drive=%d track=%d\n",
+                 (int) (ds - DrvSt) + 1, ds -> Track >> 1);
+    ds -> TrkBufChanged = 0;
+  }
+  return;
+#else
   int idx;
   int drive = (int) (ds - DrvSt);
   uint32_t hostTransaction = BeginDiskHostIO("track-flush", drive,
@@ -1912,6 +1943,7 @@ void WriteTrack(struct DriveState * ds) {
     DiskFlushResumeElapsed = flushElapsed;
     DiskFlushResumePending = true;
   }
+#endif
 }
 
 /***************************************************************************************************************************************/
@@ -1996,7 +2028,6 @@ void ResetDiskLoaderDiagnostics() {
   DiskLoaderCheckTrack = -1;
   DiskLoaderStagnantIntervals = 0;
   DiskLoaderSnapshotDumped = false;
-#endif
 }
 
 void CheckDiskLoaderSearch() {
@@ -2401,6 +2432,7 @@ void DiskAutoID(struct DriveState * ds) {
     else
       ds -> DiskType = DOSType;
   }
+#endif
 }
 
 /***************************************************************************************************************************************/
@@ -2437,6 +2469,11 @@ void MountDisk(int disk) {
   }
   //    ds->WritePro = ( attr & FA_RDONLY ) ? 1 : 0;
   ds -> WritePro = DriveSavePath[disk][0] ? 0 : 1;
+#if DISK_WRITE_AB_MODE == DISK_WRITE_AB_READ_ONLY
+  // Preserve normal overlay selection/loading, but expose write protection to
+  // the guest so TrackBuffer mutation and Q7 write sessions are rejected.
+  ds -> WritePro = 1;
+#endif
   ds -> DiskFH = openDisk(ds -> DiskFN, (ds -> WritePro ? O_RDONLY : O_RDWR));
   ds -> DiskSize = 0L;
   if (ds -> DiskFH >= 0) {

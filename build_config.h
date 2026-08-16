@@ -46,6 +46,20 @@
 #define ENABLE_DISK_SECTOR_TRACE 0
 #endif
 
+// Writable-save diagnostic A/B mode. Both modes retain normal .sav.dsk
+// discovery/creation and load the same bytes. Mode B only makes guest media
+// write-protected and suppresses runtime persistence, allowing otherwise
+// identical runs to isolate writable-disk behavior as a regression boundary.
+#define DISK_WRITE_AB_WRITABLE 0
+#define DISK_WRITE_AB_READ_ONLY 1
+#ifndef DISK_WRITE_AB_MODE
+#define DISK_WRITE_AB_MODE DISK_WRITE_AB_WRITABLE
+#endif
+#if DISK_WRITE_AB_MODE != DISK_WRITE_AB_WRITABLE && \
+    DISK_WRITE_AB_MODE != DISK_WRITE_AB_READ_ONLY
+#error "DISK_WRITE_AB_MODE must be DISK_WRITE_AB_WRITABLE or DISK_WRITE_AB_READ_ONLY"
+#endif
+
 // One-shot writable-memory provenance and control-flow diagnostic. Change
 // only these bounds to retarget the existing bounded framework.
 #ifndef MEMORY_DIAGNOSTIC_FIRST

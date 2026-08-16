@@ -868,6 +868,7 @@ struct __attribute__((packed)) LCByteProvenance {
   uint8_t firstNewValue;
   uint8_t latestOldValue;
   uint8_t latestNewValue;
+  uint8_t latestOpcode;
   uint8_t firstFlags;
   uint8_t firstOpcode;
   uint8_t firstA;
@@ -1245,6 +1246,7 @@ static void RecordLCWrite(unsigned short address, unsigned char oldValue,
   entry->latestPC = CPUInstructionStartPC;
   entry->latestOldValue = oldValue;
   entry->latestNewValue = newValue;
+  entry->latestOpcode = opcode;
 }
 #else
 static void ResetIIeProvenanceDiagnostics() {}
@@ -1507,6 +1509,49 @@ static void DumpLCTargetSummary(unsigned int selectedBankIndex) {
     }
     runFirst = runLast + 1;
   }
+}
+
+static void DumpCriticalD6Writers(unsigned int selectedBankIndex) {
+  const unsigned short first = 0xD6E8;
+  const unsigned short last = 0xD6EF;
+  DEBUG_PRINTF("[D6-WRITER] BEGIN D6E8-D6EF diskAB=%c selected=%s\n",
+#if DISK_WRITE_AB_MODE == DISK_WRITE_AB_READ_ONLY
+               'B',
+#else
+               'A',
+#endif
+               MemoryProvenanceBankName(selectedBankIndex));
+  for (unsigned short address = first; address <= last; address++) {
+    bool found = false;
+    for (unsigned int bankIndex = 0;
+         bankIndex < MEMORY_PROVENANCE_BANKS; bankIndex++) {
+      const LCByteProvenance * entry = LCProvenanceEntry(bankIndex, address);
+      if (!entry || !entry->writeCount)
+        continue;
+      found = true;
+      DEBUG_PRINTF("[D6-WRITER] %04X bank=%s value=%02X writes=%u "
+                   "first=%llu:%04X:%02X:%02X->%02X "
+                   "latest=%llu:%04X:%02X:%02X->%02X source=%s",
+                   address,
+                   MemoryProvenanceBankNameForAddress(bankIndex, address),
+                   MemoryProvenanceBackingValue(bankIndex, address),
+                   entry->writeCount, entry->firstCycle, entry->firstPC,
+                   entry->firstOpcode, entry->firstOldValue,
+                   entry->firstNewValue, entry->latestCycle,
+                   entry->latestPC, entry->latestOpcode,
+                   entry->latestOldValue, entry->latestNewValue,
+                   LCSourceKindName(entry->firstSourceKind));
+      if (entry->firstSourceAddress != 0xFFFF)
+        DEBUG_PRINTF("@%04X", entry->firstSourceAddress);
+      DEBUG_PRINTLN();
+    }
+    if (!found) {
+      DEBUG_PRINTF("[D6-WRITER] %04X value=%02X writer=unrecorded\n",
+                   address,
+                   MemoryProvenanceBackingValue(selectedBankIndex, address));
+    }
+  }
+  DEBUG_PRINTLN("[D6-WRITER] END");
 }
 
 static void DumpLCWriteProvenance(unsigned int selectedBankIndex) {
@@ -1818,6 +1863,7 @@ void CaptureMemoryRangeDiagnostics(unsigned short address) {
 
   DumpMemoryLightHistory();
   DumpLCWriteProvenance(selectedBankIndex);
+  DumpCriticalD6Writers(selectedBankIndex);
   DumpCopyCorrelation(selectedBankIndex);
   DumpMappedMemoryRange("visible", first, last);
   if (first < 0xC000) {
