@@ -900,14 +900,27 @@ struct __attribute__((packed)) MemoryControlFlowEntry {
   uint8_t taken;
 };
 
+struct __attribute__((packed)) MemoryLightHistoryEntry {
+  uint16_t pc;
+  uint16_t effectiveAddress;
+  uint16_t nextPC;
+  uint8_t opcode;
+  uint8_t sr;
+};
+
 static LCByteProvenance * LCProvenance = NULL;
 static const unsigned int LC_WRITER_CONTEXTS = 8;
 static LCWriterContext * LCWriterContexts = NULL;
-static const unsigned int MEMORY_CONTROL_FLOW_SIZE = 64;
+static const unsigned int MEMORY_LIGHT_HISTORY_SIZE = 64;
+static MemoryLightHistoryEntry * MemoryLightHistory = NULL;
+static unsigned int MemoryLightHistoryCount = 0;
+static unsigned int MemoryLightHistoryNext = 0;
+static const unsigned int MEMORY_CONTROL_FLOW_SIZE = 256;
 static MemoryControlFlowEntry * MemoryControlFlow = NULL;
 static unsigned int MemoryControlFlowCount = 0;
 static unsigned int MemoryControlFlowNext = 0;
 static bool MemoryDiagnosticCaptured = false;
+static bool MemoryDetailedFlowDumped = false;
 
 static bool EnsureIIeProvenanceDiagnosticsStorage() {
   size_t provenanceBytes = sizeof(LCByteProvenance) *
@@ -936,8 +949,16 @@ static bool EnsureIIeProvenanceDiagnosticsStorage() {
       memset(MemoryControlFlow, 0,
              sizeof(MemoryControlFlowEntry) * MEMORY_CONTROL_FLOW_SIZE);
   }
+  if (!MemoryLightHistory) {
+    MemoryLightHistory = (MemoryLightHistoryEntry *) heap_caps_malloc(
+      sizeof(MemoryLightHistoryEntry) * MEMORY_LIGHT_HISTORY_SIZE,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (MemoryLightHistory)
+      memset(MemoryLightHistory, 0,
+             sizeof(MemoryLightHistoryEntry) * MEMORY_LIGHT_HISTORY_SIZE);
+  }
   return LCProvenance != NULL && LCWriterContexts != NULL &&
-         MemoryControlFlow != NULL;
+         MemoryControlFlow != NULL && MemoryLightHistory != NULL;
 }
 
 void InitializeMemoryProvenanceDiagnostics() {
@@ -945,7 +966,8 @@ void InitializeMemoryProvenanceDiagnostics() {
   size_t requested = sizeof(LCByteProvenance) * MEMORY_PROVENANCE_BANKS *
                      MEMORY_PROVENANCE_BYTES +
                      sizeof(LCWriterContext) * LC_WRITER_CONTEXTS +
-                     sizeof(MemoryControlFlowEntry) * MEMORY_CONTROL_FLOW_SIZE;
+                     sizeof(MemoryControlFlowEntry) * MEMORY_CONTROL_FLOW_SIZE +
+                     sizeof(MemoryLightHistoryEntry) * MEMORY_LIGHT_HISTORY_SIZE;
   if (ready) {
     DEBUG_PRINTF("[LC-PROV] storage ready bytes=%u allocator=internal-8bit "
                  "location=%p flow=%p freeHeap=%u maxAlloc=%u "
@@ -964,6 +986,12 @@ void InitializeMemoryProvenanceDiagnostics() {
                  (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
   }
+  DEBUG_PRINTF("[MEM-DIAG] bounds=%04X-%04X trigger=%04X-%04X "
+               "lightweight=1 recent=%u detailedAfterTrigger=%u\n",
+               MEMORY_PROVENANCE_FIRST, MEMORY_PROVENANCE_LAST,
+               MEMORY_DIAGNOSTIC_TRIGGER_FIRST,
+               MEMORY_DIAGNOSTIC_TRIGGER_LAST,
+               MEMORY_LIGHT_HISTORY_SIZE, MEMORY_CONTROL_FLOW_SIZE);
 }
 
 static void ResetIIeProvenanceDiagnostics() {
@@ -978,9 +1006,15 @@ static void ResetIIeProvenanceDiagnostics() {
   if (MemoryControlFlow)
     memset(MemoryControlFlow, 0,
            sizeof(MemoryControlFlowEntry) * MEMORY_CONTROL_FLOW_SIZE);
+  if (MemoryLightHistory)
+    memset(MemoryLightHistory, 0,
+           sizeof(MemoryLightHistoryEntry) * MEMORY_LIGHT_HISTORY_SIZE);
+  MemoryLightHistoryCount = 0;
+  MemoryLightHistoryNext = 0;
   MemoryControlFlowCount = 0;
   MemoryControlFlowNext = 0;
   MemoryDiagnosticCaptured = false;
+  MemoryDetailedFlowDumped = false;
 }
 
 static LCByteProvenance * LCProvenanceEntry(unsigned int bankIndex,
@@ -1431,6 +1465,41 @@ static bool IsConditionalBranchOpcode(unsigned char op) {
   return false;
 }
 
+static void DumpMemoryLightHistory() {
+  if (!MemoryLightHistory || !MemoryLightHistoryCount) {
+    DEBUG_PRINTLN("[MEM-HISTORY] no completed instructions retained");
+    return;
+  }
+  DEBUG_PRINTF("[MEM-HISTORY] frozen recent instructions=%u:\n",
+               MemoryLightHistoryCount);
+  unsigned int first =
+    (MemoryLightHistoryNext + MEMORY_LIGHT_HISTORY_SIZE -
+     MemoryLightHistoryCount) % MEMORY_LIGHT_HISTORY_SIZE;
+  for (unsigned int offset = 0; offset < MemoryLightHistoryCount; offset++) {
+    const MemoryLightHistoryEntry * entry =
+      &MemoryLightHistory[(first + offset) % MEMORY_LIGHT_HISTORY_SIZE];
+    DEBUG_PRINTF("[MEM-HISTORY] PC=%04X op=%02X effective=%04X SR=%02X next=%04X",
+                 entry->pc, entry->opcode, entry->effectiveAddress,
+                 entry->sr, entry->nextPC);
+    if (IsConditionalBranchOpcode(entry->opcode)) {
+      unsigned short fallThrough = entry->pc + 2;
+      unsigned short target = fallThrough + entry->effectiveAddress;
+      DEBUG_PRINTF(" branch=%s target=%04X fallthrough=%04X",
+                   entry->nextPC == target ? "taken" : "not-taken",
+                   target, fallThrough);
+    } else if (entry->opcode == 0x4C || entry->opcode == 0x6C)
+      DEBUG_PRINTF(" JMP-target=%04X", entry->nextPC);
+    else if (entry->opcode == 0x20)
+      DEBUG_PRINTF(" JSR-target=%04X return=%04X", entry->nextPC,
+                   entry->pc + 3);
+    else if (entry->opcode == 0x60)
+      DEBUG_PRINTF(" RTS-target=%04X", entry->nextPC);
+    else if (entry->opcode == 0x40)
+      DEBUG_PRINTF(" RTI-target=%04X", entry->nextPC);
+    DEBUG_PRINTLN();
+  }
+}
+
 static void DumpMemoryDiagnosticControlFlow() {
   if (!MemoryControlFlow || !MemoryControlFlowCount) {
     DEBUG_PRINTLN("[MEM-FLOW] no recorded execution");
@@ -1467,26 +1536,55 @@ static void DumpMemoryDiagnosticControlFlow() {
 }
 #endif
 
+void CheckMemoryDiagnosticTrigger(unsigned short instructionPC) {
+#if ENABLE_CPU_TRACE
+  // This is intentionally the only pre-instruction work: one captured-state
+  // test and two integer comparisons. It fires before execCode(), so an
+  // instruction which never returns cannot evade the trigger.
+  if (!MemoryDiagnosticCaptured &&
+      instructionPC >= MEMORY_DIAGNOSTIC_TRIGGER_FIRST &&
+      instructionPC <= MEMORY_DIAGNOSTIC_TRIGGER_LAST)
+    CaptureMemoryRangeDiagnostics(instructionPC);
+#else
+  (void) instructionPC;
+#endif
+}
+
 void RecordMemoryDiagnosticControlFlow(
   unsigned short instructionPC, unsigned char instructionOpcode,
-  unsigned short effectiveAddress, unsigned char preA, unsigned char preX,
-  unsigned char preY, unsigned char preSP, unsigned char preSR,
-  uint64_t preCycles, unsigned short nextPC) {
+  unsigned short effectiveAddress, unsigned short nextPC) {
 #if ENABLE_CPU_TRACE
-  if (!MemoryControlFlow && !EnsureIIeProvenanceDiagnosticsStorage())
+  if ((!MemoryControlFlow || !MemoryLightHistory) &&
+      !EnsureIIeProvenanceDiagnosticsStorage())
+    return;
+  if (!MemoryDiagnosticCaptured) {
+    MemoryLightHistoryEntry * light =
+      &MemoryLightHistory[MemoryLightHistoryNext];
+    light->pc = instructionPC;
+    light->opcode = instructionOpcode;
+    light->effectiveAddress = effectiveAddress;
+    light->sr = SR;
+    light->nextPC = nextPC;
+    MemoryLightHistoryNext =
+      (MemoryLightHistoryNext + 1) % MEMORY_LIGHT_HISTORY_SIZE;
+    if (MemoryLightHistoryCount < MEMORY_LIGHT_HISTORY_SIZE)
+      MemoryLightHistoryCount++;
+    return;
+  }
+  if (MemoryDetailedFlowDumped)
     return;
   MemoryControlFlowEntry * entry =
     &MemoryControlFlow[MemoryControlFlowNext];
   memset(entry, 0, sizeof(*entry));
-  entry->cycles = preCycles;
+  entry->cycles = TotalCycles;
   entry->pc = instructionPC;
   entry->opcode = instructionOpcode;
   entry->effectiveAddress = effectiveAddress;
-  entry->a = preA;
-  entry->x = preX;
-  entry->y = preY;
-  entry->sp = preSP;
-  entry->sr = preSR;
+  entry->a = A;
+  entry->x = X;
+  entry->y = Y;
+  entry->sp = STP;
+  entry->sr = SR;
   entry->nextPC = nextPC;
   if (IsConditionalBranchOpcode(instructionOpcode)) {
     entry->kind = 1;
@@ -1511,14 +1609,17 @@ void RecordMemoryDiagnosticControlFlow(
     (MemoryControlFlowNext + 1) % MEMORY_CONTROL_FLOW_SIZE;
   if (MemoryControlFlowCount < MEMORY_CONTROL_FLOW_SIZE)
     MemoryControlFlowCount++;
-  if (!MemoryDiagnosticCaptured &&
-      instructionPC >= MEMORY_DIAGNOSTIC_TRIGGER_FIRST &&
-      instructionPC <= MEMORY_DIAGNOSTIC_TRIGGER_LAST)
-    CaptureMemoryRangeDiagnostics(instructionPC);
+  if (instructionOpcode == 0x00 ||
+      MemoryControlFlowCount == MEMORY_CONTROL_FLOW_SIZE) {
+    DEBUG_PRINTF("[MEM-FLOW] detailed capture stop reason=%s PC=%04X\n",
+                 instructionOpcode == 0x00 ? "BRK" : "buffer-full",
+                 instructionPC);
+    DumpMemoryDiagnosticControlFlow();
+    MemoryDetailedFlowDumped = true;
+  }
 #else
   (void) instructionPC; (void) instructionOpcode; (void) effectiveAddress;
-  (void) preA; (void) preX; (void) preY; (void) preSP; (void) preSR;
-  (void) preCycles; (void) nextPC;
+  (void) nextPC;
 #endif
 }
 
@@ -1533,11 +1634,13 @@ void CaptureMemoryRangeDiagnostics(unsigned short address) {
   unsigned char * originalROM = OriginalIIeROMBuffer();
   unsigned char * enhancedROM = EnhancedIIeROMBuffer();
   unsigned int selectedBankIndex = MemoryProvenanceBankIndex(first, false);
+  unsigned char triggerOpcode =
+    (address < 0xC000 || address >= 0xC100) ? read8(address) : 0xFF;
 
   DEBUG_PRINTLN("[CPU-MEM] BEGIN one-shot configurable memory diagnostic");
   DEBUG_PRINTF("[CPU-MEM] trigger PC=%04X opcode=%02X A=%02X X=%02X Y=%02X "
                "SP=%02X SR=%02X TotalCycles=%llu\n",
-               address, CPUInstructionOpcode, A, X, Y, STP, SR, TotalCycles);
+               address, triggerOpcode, A, X, Y, STP, SR, TotalCycles);
   DEBUG_PRINT("[CPU-MEM] recent instructions:");
   for (int historyOffset = 0; historyOffset < 16; historyOffset++) {
     unsigned char historyIndex = (CPURecentIndex + historyOffset) & 0x0F;
@@ -1564,7 +1667,7 @@ void CaptureMemoryRangeDiagnostics(unsigned short address) {
                (unsigned) iieInternalC8ROM, (unsigned) ((gm & PG2) != 0),
                (unsigned) ((gm & HRG) != 0));
 
-  DumpMemoryDiagnosticControlFlow();
+  DumpMemoryLightHistory();
   DumpLCWriteProvenance(selectedBankIndex);
   DumpMappedMemoryRange("visible", first, last);
   if (first < 0xC000) {

@@ -276,14 +276,12 @@ void Task1code( void * pvParameters ){
   for(;;) {
     CPUInstructionStartPC = PC;
     CPUInstructionOpcode = 0xFF;
-    unsigned char traceA = A, traceX = X, traceY = Y;
-    unsigned char traceSP = STP, traceSR = SR;
-    uint64_t traceCycles = TotalCycles;
+    CheckMemoryDiagnosticTrigger(CPUInstructionStartPC);
     CPUExecutionStage = 1; // fetching/executing a 6502 instruction
     execCode();
     RecordMemoryDiagnosticControlFlow(
       CPUInstructionStartPC, CPUInstructionOpcode, argument_addr,
-      traceA, traceX, traceY, traceSP, traceSR, traceCycles, PC);
+      PC);
     CPURecentPC[CPURecentIndex] = CPUInstructionStartPC;
     CPURecentOpcode[CPURecentIndex] = CPUInstructionOpcode;
     CPURecentArgument[CPURecentIndex] = argument_addr;

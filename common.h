@@ -91,11 +91,10 @@ void ArmDiskPointerWatchpoint();
 void PrintIIeMemoryDiagnostic(unsigned short address);
 void CaptureMemoryRangeDiagnostics(unsigned short address);
 void InitializeMemoryProvenanceDiagnostics();
+void CheckMemoryDiagnosticTrigger(unsigned short instructionPC);
 void RecordMemoryDiagnosticControlFlow(
   unsigned short instructionPC, unsigned char instructionOpcode,
-  unsigned short effectiveAddress, unsigned char preA,
-  unsigned char preX, unsigned char preY, unsigned char preSP,
-  unsigned char preSR, uint64_t preCycles, unsigned short nextPC);
+  unsigned short effectiveAddress, unsigned short nextPC);
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();
