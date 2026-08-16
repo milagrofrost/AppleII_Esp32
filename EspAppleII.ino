@@ -37,6 +37,7 @@
 #include "Timer.h"                    // https://github.com/JChristensen/Timer
 #include "fabgl.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "common.h"
 
 fabgl::PS2Controller    PS2Controller;          // PS/2 keyboard controller
@@ -275,8 +276,14 @@ void Task1code( void * pvParameters ){
   for(;;) {
     CPUInstructionStartPC = PC;
     CPUInstructionOpcode = 0xFF;
+    unsigned char traceA = A, traceX = X, traceY = Y;
+    unsigned char traceSP = STP, traceSR = SR;
+    uint64_t traceCycles = TotalCycles;
     CPUExecutionStage = 1; // fetching/executing a 6502 instruction
     execCode();
+    RecordD6ControlFlow(CPUInstructionStartPC, CPUInstructionOpcode,
+                        argument_addr, traceA, traceX, traceY, traceSP,
+                        traceSR, traceCycles, PC);
     CPURecentPC[CPURecentIndex] = CPUInstructionStartPC;
     CPURecentOpcode[CPURecentIndex] = CPUInstructionOpcode;
     CPURecentArgument[CPURecentIndex] = argument_addr;
@@ -554,6 +561,8 @@ void setup()
     DEBUG_PRINTLN("[BOOT] Emulator stopped because the boot disk is unavailable.");
     return;
   }
+
+  InitializeLCProvenanceDiagnostics();
 
   canvas.setPenColor(Color::BrightGreen);
   canvas.drawText(20, 50, "Disk loaded from SD:");

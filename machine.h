@@ -19,3 +19,6 @@ void ResetIIeSoftSwitches();
 bool IsIIeMode();
 bool Is65C02Mode();
 bool IIe80StoreEnabled();
+unsigned char * OriginalIIeROMBuffer();
+unsigned char * EnhancedIIeROMBuffer();
+bool EnhancedIIeROMIsAvailable();

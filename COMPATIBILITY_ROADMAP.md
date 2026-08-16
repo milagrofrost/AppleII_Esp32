@@ -539,6 +539,13 @@ Use as the primary standalone CPU correctness suite for NMOS 6502 and 65C02 beha
 
 # Suggested implementation order
 
+When runtime behavior contradicts the selected machine model, freeze
+compatibility feature work and resolve the invariant violation before adding a
+workaround.
+
+When suspicious code is confirmed to reside in writable RAM, establish byte
+provenance before changing CPU semantics.
+
 ## Current validation baseline
 
 - Built-in isolated CPU smoke harness: **29/29 PASS on ESP32 hardware**

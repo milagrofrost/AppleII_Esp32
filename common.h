@@ -44,6 +44,10 @@ extern unsigned short PC;
 extern unsigned char STP, A, X, Y, SR;
 extern unsigned char opcode, opflags;
 extern unsigned short argument_addr;
+
+// Forward declaration required by Arduino's generated prototypes for the
+// diagnostics-local definition in memory.ino.
+struct LCByteProvenance;
 extern const unsigned char scancode_to_apple[];
 extern unsigned long cycle;
 extern uint64_t TotalCycles;
@@ -85,6 +89,13 @@ void PrintDiskHostIOState();
 bool ConsumeDiskFlushResume(uint32_t * transaction, unsigned long * elapsedMs);
 void ArmDiskPointerWatchpoint();
 void PrintIIeMemoryDiagnostic(unsigned short address);
+void CaptureNMOS80MemoryProvenance(unsigned short address);
+void InitializeLCProvenanceDiagnostics();
+void RecordD6ControlFlow(unsigned short instructionPC, unsigned char instructionOpcode,
+                         unsigned short effectiveAddress, unsigned char preA,
+                         unsigned char preX, unsigned char preY, unsigned char preSP,
+                         unsigned char preSR, uint64_t preCycles,
+                         unsigned short nextPC);
 
 // Host-side disk image management: startup boot image and second-drive runtime swaps.
 bool LoadBootDiskFromSD();

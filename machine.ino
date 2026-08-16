@@ -20,6 +20,18 @@ bool Is65C02Mode() {
   return MachineProfile == APPLE_IIE_ENHANCED_128K;
 }
 
+unsigned char * OriginalIIeROMBuffer() {
+  return OriginalIIeROM;
+}
+
+unsigned char * EnhancedIIeROMBuffer() {
+  return EnhancedIIeROM;
+}
+
+bool EnhancedIIeROMIsAvailable() {
+  return EnhancedIIeROMAvailable;
+}
+
 const char * MachineProfileName() {
   if (Is65C02Mode()) return "ENHANCED IIE 128K";
   return IsIIeMode() ? "APPLE IIE 128K" : "APPLE II+ 64K";
