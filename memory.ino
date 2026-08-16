@@ -834,6 +834,15 @@ static const unsigned int MEMORY_PROVENANCE_BYTES =
   MEMORY_PROVENANCE_LAST - MEMORY_PROVENANCE_FIRST + 1;
 static const unsigned int MEMORY_PROVENANCE_BANKS =
   MEMORY_PROVENANCE_FIRST >= 0xD000 ? 4 : 2;
+static const unsigned short MEMORY_SOURCE_FIRST = MEMORY_DIAGNOSTIC_SOURCE_FIRST;
+static const unsigned short MEMORY_SOURCE_LAST = MEMORY_DIAGNOSTIC_SOURCE_LAST;
+static const unsigned int MEMORY_SOURCE_BYTES =
+  MEMORY_SOURCE_LAST - MEMORY_SOURCE_FIRST + 1;
+static const unsigned int MEMORY_SOURCE_BANKS = 2;
+static const unsigned short COPY_SOURCE_FIRST = 0x58D0;
+static const unsigned short COPY_SOURCE_LAST = 0x58F8;
+static const unsigned int COPY_SOURCE_BYTES =
+  COPY_SOURCE_LAST - COPY_SOURCE_FIRST + 1;
 
 enum LCSourceKind : uint8_t {
   LC_SOURCE_UNKNOWN = 0,
@@ -908,7 +917,20 @@ struct __attribute__((packed)) MemoryLightHistoryEntry {
   uint8_t sr;
 };
 
+struct __attribute__((packed)) CopySourceSnapshotEntry {
+  uint64_t writerCycle;
+  uint16_t writerPC;
+  uint8_t value;
+  uint8_t bankIndex;
+  uint8_t writeCountKnown;
+};
+
 static LCByteProvenance * LCProvenance = NULL;
+static LCByteProvenance * SourceProvenance = NULL;
+static CopySourceSnapshotEntry * CopySourceBefore = NULL;
+static bool CopySourceBeforeCaptured = false;
+static uint64_t CopySourceReadCycle = 0;
+static uint16_t CopySourceReaderPC = 0;
 static const unsigned int LC_WRITER_CONTEXTS = 8;
 static LCWriterContext * LCWriterContexts = NULL;
 static const unsigned int MEMORY_LIGHT_HISTORY_SIZE = 64;
@@ -925,6 +947,8 @@ static bool MemoryDetailedFlowDumped = false;
 static bool EnsureIIeProvenanceDiagnosticsStorage() {
   size_t provenanceBytes = sizeof(LCByteProvenance) *
                            MEMORY_PROVENANCE_BANKS * MEMORY_PROVENANCE_BYTES;
+  size_t sourceProvenanceBytes = sizeof(LCByteProvenance) *
+                                 MEMORY_SOURCE_BANKS * MEMORY_SOURCE_BYTES;
   if (!LCProvenance) {
     LCProvenance = (LCByteProvenance *) heap_caps_malloc(
       provenanceBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -932,6 +956,20 @@ static bool EnsureIIeProvenanceDiagnosticsStorage() {
       memset(LCProvenance, 0,
              sizeof(LCByteProvenance) * MEMORY_PROVENANCE_BANKS *
              MEMORY_PROVENANCE_BYTES);
+  }
+  if (!SourceProvenance) {
+    SourceProvenance = (LCByteProvenance *) heap_caps_malloc(
+      sourceProvenanceBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (SourceProvenance)
+      memset(SourceProvenance, 0, sourceProvenanceBytes);
+  }
+  if (!CopySourceBefore) {
+    CopySourceBefore = (CopySourceSnapshotEntry *) heap_caps_malloc(
+      sizeof(CopySourceSnapshotEntry) * COPY_SOURCE_BYTES,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (CopySourceBefore)
+      memset(CopySourceBefore, 0,
+             sizeof(CopySourceSnapshotEntry) * COPY_SOURCE_BYTES);
   }
   if (!LCWriterContexts) {
     LCWriterContexts = (LCWriterContext *) heap_caps_malloc(
@@ -957,7 +995,8 @@ static bool EnsureIIeProvenanceDiagnosticsStorage() {
       memset(MemoryLightHistory, 0,
              sizeof(MemoryLightHistoryEntry) * MEMORY_LIGHT_HISTORY_SIZE);
   }
-  return LCProvenance != NULL && LCWriterContexts != NULL &&
+  return LCProvenance != NULL && SourceProvenance != NULL &&
+         CopySourceBefore != NULL && LCWriterContexts != NULL &&
          MemoryControlFlow != NULL && MemoryLightHistory != NULL;
 }
 
@@ -965,6 +1004,9 @@ void InitializeMemoryProvenanceDiagnostics() {
   bool ready = EnsureIIeProvenanceDiagnosticsStorage();
   size_t requested = sizeof(LCByteProvenance) * MEMORY_PROVENANCE_BANKS *
                      MEMORY_PROVENANCE_BYTES +
+                     sizeof(LCByteProvenance) * MEMORY_SOURCE_BANKS *
+                     MEMORY_SOURCE_BYTES +
+                     sizeof(CopySourceSnapshotEntry) * COPY_SOURCE_BYTES +
                      sizeof(LCWriterContext) * LC_WRITER_CONTEXTS +
                      sizeof(MemoryControlFlowEntry) * MEMORY_CONTROL_FLOW_SIZE +
                      sizeof(MemoryLightHistoryEntry) * MEMORY_LIGHT_HISTORY_SIZE;
@@ -979,16 +1021,18 @@ void InitializeMemoryProvenanceDiagnostics() {
   } else {
     DEBUG_PRINTF("[LC-PROV] storage allocation FAILED requested=%u "
                  "allocator=heap_caps_malloc(INTERNAL|8BIT) provenance=%p "
-                 "contexts=%p flow=%p freeHeap=%u maxAlloc=%u "
+                 "source=%p contexts=%p flow=%p freeHeap=%u maxAlloc=%u "
                  "freePSRAM=%u largestPSRAM=%u\n",
-                 (unsigned) requested, LCProvenance, LCWriterContexts,
+                 (unsigned) requested, LCProvenance, SourceProvenance,
+                 LCWriterContexts,
                  MemoryControlFlow, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
                  (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
   }
-  DEBUG_PRINTF("[MEM-DIAG] bounds=%04X-%04X trigger=%04X-%04X "
-               "lightweight=1 recent=%u detailedAfterTrigger=%u\n",
+  DEBUG_PRINTF("[MEM-DIAG] bounds=%04X-%04X sourceWatch=%04X-%04X "
+               "trigger=%04X-%04X lightweight=1 recent=%u detailedAfterTrigger=%u\n",
                MEMORY_PROVENANCE_FIRST, MEMORY_PROVENANCE_LAST,
+               MEMORY_SOURCE_FIRST, MEMORY_SOURCE_LAST,
                MEMORY_DIAGNOSTIC_TRIGGER_FIRST,
                MEMORY_DIAGNOSTIC_TRIGGER_LAST,
                MEMORY_LIGHT_HISTORY_SIZE, MEMORY_CONTROL_FLOW_SIZE);
@@ -1000,6 +1044,16 @@ static void ResetIIeProvenanceDiagnostics() {
     memset(LCProvenance, 0,
            sizeof(LCByteProvenance) * MEMORY_PROVENANCE_BANKS *
            MEMORY_PROVENANCE_BYTES);
+  if (SourceProvenance)
+    memset(SourceProvenance, 0,
+           sizeof(LCByteProvenance) * MEMORY_SOURCE_BANKS *
+           MEMORY_SOURCE_BYTES);
+  if (CopySourceBefore)
+    memset(CopySourceBefore, 0,
+           sizeof(CopySourceSnapshotEntry) * COPY_SOURCE_BYTES);
+  CopySourceBeforeCaptured = false;
+  CopySourceReadCycle = 0;
+  CopySourceReaderPC = 0;
   if (LCWriterContexts)
     memset(LCWriterContexts, 0,
            sizeof(LCWriterContext) * LC_WRITER_CONTEXTS);
@@ -1019,11 +1073,18 @@ static void ResetIIeProvenanceDiagnostics() {
 
 static LCByteProvenance * LCProvenanceEntry(unsigned int bankIndex,
                                              unsigned short address) {
-  if (!LCProvenance || bankIndex >= MEMORY_PROVENANCE_BANKS ||
-      address < MEMORY_PROVENANCE_FIRST || address > MEMORY_PROVENANCE_LAST)
-    return NULL;
-  return &LCProvenance[bankIndex * MEMORY_PROVENANCE_BYTES +
-                       address - MEMORY_PROVENANCE_FIRST];
+  if (address >= MEMORY_PROVENANCE_FIRST &&
+      address <= MEMORY_PROVENANCE_LAST) {
+    if (!LCProvenance || bankIndex >= MEMORY_PROVENANCE_BANKS) return NULL;
+    return &LCProvenance[bankIndex * MEMORY_PROVENANCE_BYTES +
+                         address - MEMORY_PROVENANCE_FIRST];
+  }
+  if (address >= MEMORY_SOURCE_FIRST && address <= MEMORY_SOURCE_LAST) {
+    if (!SourceProvenance || bankIndex >= MEMORY_SOURCE_BANKS) return NULL;
+    return &SourceProvenance[bankIndex * MEMORY_SOURCE_BYTES +
+                             address - MEMORY_SOURCE_FIRST];
+  }
+  return NULL;
 }
 
 static unsigned int MemoryProvenanceBankIndex(unsigned short address,
@@ -1041,6 +1102,15 @@ static const char * MemoryProvenanceBankName(unsigned int bankIndex) {
   if (bankIndex >= MEMORY_PROVENANCE_BANKS) return "unknown-bank";
   return MEMORY_PROVENANCE_FIRST >= 0xD000 ? lcNames[bankIndex]
                                             : ramNames[bankIndex];
+}
+
+static const char * MemoryProvenanceBankNameForAddress(
+  unsigned int bankIndex, unsigned short address) {
+  if (address < 0xD000) {
+    static const char * const ramNames[2] = { "main-ram", "aux-ram" };
+    return bankIndex < 2 ? ramNames[bankIndex] : "unknown-ram";
+  }
+  return MemoryProvenanceBankName(bankIndex);
 }
 
 static const char * LCSourceKindName(unsigned int sourceKind) {
@@ -1113,7 +1183,11 @@ static void CaptureLCWriterContext(unsigned int bankIndex,
 
 static void RecordLCWrite(unsigned short address, unsigned char oldValue,
                           unsigned char newValue) {
-  if (address < MEMORY_PROVENANCE_FIRST || address > MEMORY_PROVENANCE_LAST)
+  bool destination = address >= MEMORY_PROVENANCE_FIRST &&
+                     address <= MEMORY_PROVENANCE_LAST;
+  bool source = address >= MEMORY_SOURCE_FIRST &&
+                address <= MEMORY_SOURCE_LAST;
+  if (!destination && !source)
     return;
   // Validation harnesses can bypass normal post-startup initialization, so
   // retain a guarded allocation fallback on the first relevant LC write.
@@ -1321,7 +1395,8 @@ static void DumpLCProvenanceEntry(unsigned int bankIndex,
                "firstCycle=%llu firstPC=%04X first=%02X->%02X "
                "latestCycle=%llu latestPC=%04X latest=%02X->%02X "
                "opcode=%02X A=%02X X=%02X Y=%02X source=%s",
-               address, MemoryProvenanceBankName(bankIndex), entry->writeCount,
+               address, MemoryProvenanceBankNameForAddress(bankIndex, address),
+               entry->writeCount,
                entry->firstCycle, entry->firstPC, entry->firstOldValue,
                entry->firstNewValue, entry->latestCycle, entry->latestPC,
                entry->latestOldValue, entry->latestNewValue,
@@ -1351,7 +1426,8 @@ static void DumpLCWriterContexts() {
       continue;
     DEBUG_PRINTF("[LC-PROV] writer-context bank=%s target=%04X pc=%04X "
                  "opcode=%02X value=%02X A=%02X X=%02X Y=%02X history:",
-                 MemoryProvenanceBankName(context->bankIndex),
+                 MemoryProvenanceBankNameForAddress(context->bankIndex,
+                                                    context->targetAddress),
                  context->targetAddress, context->writerPC, context->opcode,
                  context->value, context->a, context->x, context->y);
     for (unsigned int j = 0; j < 16; j++)
@@ -1363,8 +1439,11 @@ static void DumpLCWriterContexts() {
 
 static unsigned char MemoryProvenanceBackingValue(unsigned int bankIndex,
                                                    unsigned short address) {
-  if (bankIndex == 0) return RAM[address];
-  if (bankIndex == 1) return AUXRAM ? AUXRAM[address] : 0;
+  if (address < 0xD000) {
+    if (bankIndex == 0) return RAM[address];
+    if (bankIndex == 1) return AUXRAM ? AUXRAM[address] : 0;
+    return 0;
+  }
   bool auxiliary = bankIndex >= 2;
   bool bank2 = (bankIndex & 1) != 0;
   unsigned char * buffer = auxiliary ? AUXRAMEXT : RAMEXT;
@@ -1452,8 +1531,78 @@ static void DumpLCWriteProvenance(unsigned int selectedBankIndex) {
   }
   if (!any)
     DEBUG_PRINTLN("[LC-PROV] no recorded writes in configured range");
+  any = false;
+  DEBUG_PRINTF("[SRC-PROV] written bytes %04X-%04X by physical bank:\n",
+               MEMORY_SOURCE_FIRST, MEMORY_SOURCE_LAST);
+  for (unsigned int bankIndex = 0; bankIndex < MEMORY_SOURCE_BANKS;
+       bankIndex++) {
+    for (unsigned short address = MEMORY_SOURCE_FIRST;
+         address <= MEMORY_SOURCE_LAST; address++) {
+      const LCByteProvenance * entry = LCProvenanceEntry(bankIndex, address);
+      if (!entry || !entry->writeCount) continue;
+      any = true;
+      DumpLCProvenanceEntry(bankIndex, address, entry);
+    }
+  }
+  if (!any)
+    DEBUG_PRINTLN("[SRC-PROV] no recorded writes in source-watch range");
   DumpLCTargetSummary(selectedBankIndex);
   DumpLCWriterContexts();
+}
+
+static void DumpCopyCorrelation(unsigned int destinationBankIndex) {
+  DEBUG_PRINTF("[COPY-PROV] source-before-copy captured=%u readerPC=%04X cycle=%llu\n",
+               (unsigned) CopySourceBeforeCaptured, CopySourceReaderPC,
+               CopySourceReadCycle);
+  const unsigned short compareFirst = 0x58DD;
+  const unsigned short compareLast = 0x58F0;
+  for (unsigned short source = compareFirst; source <= compareLast; source++) {
+    unsigned short destination = source + 0x7E00;
+    unsigned int sourceIndex = source - COPY_SOURCE_FIRST;
+    const CopySourceSnapshotEntry * before =
+      CopySourceBeforeCaptured ? &CopySourceBefore[sourceIndex] : NULL;
+    unsigned int currentSourceBank = MemoryProvenanceBankIndex(source, false);
+    unsigned char currentSource =
+      MemoryProvenanceBackingValue(currentSourceBank, source);
+    unsigned char destinationValue =
+      MemoryProvenanceBackingValue(destinationBankIndex, destination);
+    const LCByteProvenance * destinationProvenance =
+      LCProvenanceEntry(destinationBankIndex, destination);
+    DEBUG_PRINTF("[COPY-PROV] src=%04X before=%s",
+                 source, before ? "captured" : "unavailable");
+    if (before) DEBUG_PRINTF(":%02X", before->value);
+    DEBUG_PRINTF(" current=%02X dst=%04X value=%02X %s",
+                 currentSource, destination, destinationValue,
+                 currentSource == destinationValue ? "MATCH" : "MISMATCH");
+    if (before && before->writeCountKnown)
+      DEBUG_PRINTF(" sourceLastWriter=%04X@%llu", before->writerPC,
+                   before->writerCycle);
+    else if (before)
+      DEBUG_PRINT(" sourceLastWriter=unrecorded");
+    if (destinationProvenance && destinationProvenance->writeCount) {
+      DEBUG_PRINTF(" dstFirst=%04X:%02X:%02X dstLatest=%04X:%02X writes=%u",
+                   destinationProvenance->firstPC,
+                   destinationProvenance->firstOpcode,
+                   destinationProvenance->firstNewValue,
+                   destinationProvenance->latestPC,
+                   destinationProvenance->latestNewValue,
+                   destinationProvenance->writeCount);
+      if (before && (destinationProvenance->firstPC == 0x29D8 ||
+                     destinationProvenance->firstPC == 0x29D6))
+        DEBUG_PRINTF(" copyExact=%u",
+                     (unsigned) (before->value ==
+                                 destinationProvenance->firstNewValue));
+      if (destinationProvenance->firstSourceAddress != 0xFFFF)
+        DEBUG_PRINTF(" inferredSource=%04X",
+                     destinationProvenance->firstSourceAddress);
+      DEBUG_PRINTF(" changedAfterCopy=%u",
+                   (unsigned) (destinationProvenance->latestPC != 0x29D8 &&
+                               destinationProvenance->latestPC != 0x29D6));
+    } else {
+      DEBUG_PRINT(" dstWriter=unrecorded");
+    }
+    DEBUG_PRINTLN();
+  }
 }
 
 static bool IsConditionalBranchOpcode(unsigned char op) {
@@ -1669,6 +1818,7 @@ void CaptureMemoryRangeDiagnostics(unsigned short address) {
 
   DumpMemoryLightHistory();
   DumpLCWriteProvenance(selectedBankIndex);
+  DumpCopyCorrelation(selectedBankIndex);
   DumpMappedMemoryRange("visible", first, last);
   if (first < 0xC000) {
     DumpBackingMemoryRange("main-ram", RAM, first, first, last);
@@ -1686,6 +1836,12 @@ void CaptureMemoryRangeDiagnostics(unsigned short address) {
     DumpBackingMemoryRange("aux-lc-bank1", AUXRAMEXT, lcBank1Offset, first, last);
     DumpBackingMemoryRange("aux-lc-bank2", AUXRAMEXT, lcBank2Offset, first, last);
   }
+  DumpMappedMemoryRange("source-visible", MEMORY_SOURCE_FIRST,
+                        MEMORY_SOURCE_LAST);
+  DumpBackingMemoryRange("source-main-ram", RAM, MEMORY_SOURCE_FIRST,
+                         MEMORY_SOURCE_FIRST, MEMORY_SOURCE_LAST);
+  DumpBackingMemoryRange("source-aux-ram", AUXRAM, MEMORY_SOURCE_FIRST,
+                         MEMORY_SOURCE_FIRST, MEMORY_SOURCE_LAST);
 
   unsigned char * selectedBacking = NULL;
   unsigned int selectedBackingOffset = 0;
@@ -1758,10 +1914,39 @@ unsigned char readPgz8(unsigned short address) {
 /***************************************************************************************************************************************/
 
 /***************************************************************************************************************************************/
+#if ENABLE_CPU_TRACE
+static void ObserveCopySourceRead(unsigned short address) {
+  if (CopySourceBeforeCaptured || address < COPY_SOURCE_FIRST ||
+      address > COPY_SOURCE_LAST || CPUInstructionStartPC < 0x29D0 ||
+      CPUInstructionStartPC > 0x29DF || !CopySourceBefore)
+    return;
+  CopySourceBeforeCaptured = true;
+  CopySourceReadCycle = TotalCycles;
+  CopySourceReaderPC = CPUInstructionStartPC;
+  for (unsigned short source = COPY_SOURCE_FIRST;
+       source <= COPY_SOURCE_LAST; source++) {
+    unsigned int index = source - COPY_SOURCE_FIRST;
+    unsigned int bankIndex = MemoryProvenanceBankIndex(source, false);
+    unsigned char * backing = bankIndex == 1 ? AUXRAM : RAM;
+    CopySourceBefore[index].value = backing ? backing[source] : 0;
+    CopySourceBefore[index].bankIndex = bankIndex;
+    LCByteProvenance * provenance = LCProvenanceEntry(bankIndex, source);
+    if (provenance && provenance->writeCount) {
+      CopySourceBefore[index].writerCycle = provenance->latestCycle;
+      CopySourceBefore[index].writerPC = provenance->latestPC;
+      CopySourceBefore[index].writeCountKnown = 1;
+    }
+  }
+}
+#endif
+
 unsigned char read8(unsigned short address) {
 #if ENABLE_KLAUS_CPU_TEST
   if (CPUValidationFlatMemory)
     return CPUValidationMemory[address];
+#endif
+#if ENABLE_CPU_TRACE
+  ObserveCopySourceRead(address);
 #endif
   unsigned char page = address>>8;
   if(page < 0xC0) {
@@ -1873,8 +2058,9 @@ void write8(unsigned short address, unsigned char value) {
     bool auxiliary = IIeUseAuxiliaryRAM(address, true);
     unsigned char * target = auxiliary ? AUXRAM : RAM;
 #if ENABLE_CPU_TRACE
-    if (address >= MEMORY_PROVENANCE_FIRST &&
-        address <= MEMORY_PROVENANCE_LAST)
+    if ((address >= MEMORY_PROVENANCE_FIRST &&
+         address <= MEMORY_PROVENANCE_LAST) ||
+        (address >= MEMORY_SOURCE_FIRST && address <= MEMORY_SOURCE_LAST))
       RecordLCWrite(address, target[address], value);
 #endif
     target[address] = value;
@@ -1885,8 +2071,9 @@ void write8(unsigned short address, unsigned char value) {
       unsigned char * lcBuffer = IsIIeMode() && iieAltZeroPage ? AUXRAMEXT : RAMEXT;
       unsigned int lcIndex = LanguageCardIndex(address);
 #if ENABLE_CPU_TRACE
-        if (address >= MEMORY_PROVENANCE_FIRST &&
-            address <= MEMORY_PROVENANCE_LAST)
+        if ((address >= MEMORY_PROVENANCE_FIRST &&
+             address <= MEMORY_PROVENANCE_LAST) ||
+            (address >= MEMORY_SOURCE_FIRST && address <= MEMORY_SOURCE_LAST))
           RecordLCWrite(address, lcBuffer[lcIndex], value);
 #endif
       lcBuffer[lcIndex] = value;
